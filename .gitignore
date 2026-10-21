@@ -1,0 +1,6 @@
+__pycache__/
+*.pyc
+*.blend1
+*.zip
+/tests/output/
+/tests/install_sandbox/
