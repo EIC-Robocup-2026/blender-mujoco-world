@@ -96,8 +96,10 @@ no room-specific layout or colour recipe.
 ### Keep authored worlds editable
 
 A saved Blender project is the authoring source. Exported XML and its asset
-folder are the simulation deliverable. `walkie-worlds` owns the room content;
-`walkie-ros` only integrates the robot and supplies ROS launches.
+folder are the simulation deliverable. Walkie's room sources and exported assets
+live in `walkie-ros/simulation/gazebo/worlds/` and are installed with the
+`robot_simulation` package. This add-on stays in its separate repository;
+`walkie-ros` supplies robot integration and ROS launches.
 
 For an existing Blender scene accompanied by a matching expanded world XML,
 **World advanced settings → Adopt existing MJCF physics** associates same-named
@@ -159,7 +161,7 @@ When merging into the current Walkie model, use its existing collision-mask sche
 | Movable contact type | `32` |
 | Movable contact mask | `121` |
 
-Do not add a second plane named `floor` when merging with a robot scene that already supplies it. Preserve the four explicit wheel/floor pairs in the existing integration script. An isolated exported world defaults to masks `1/1` so ordinary free objects collide normally.
+Do not add a second plane named `floor` when merging with a robot scene that already supplies it. Walkie's ROS launch uses the installed `robot_bringup.world_loader` library to combine the exported room with the robot and preserve its four explicit wheel/floor pairs. An isolated exported world defaults to masks `1/1` so ordinary free objects collide normally.
 
 ## Scope and verification
 
