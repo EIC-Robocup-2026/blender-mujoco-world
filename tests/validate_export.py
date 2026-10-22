@@ -4,6 +4,7 @@ import math
 from pathlib import Path
 import shutil
 import tempfile
+import xml.etree.ElementTree as ET
 
 import mujoco
 import numpy as np
@@ -104,7 +105,40 @@ for obj in report["object_details"]:
     if obj["role"] == "VISUAL":
         continue
     geom = walkie.geom(obj["body"] + "_collision")
-    assert (int(geom.contype[0]), int(geom.conaffinity[0])) == ((32, 121) if obj["role"] == "FREE" else (64, 56))
+    assert (int(geom.contype[0]), int(geom.conaffinity[0])) == ((32, 121) if obj["role"] in {"FREE", "HINGE"} else (64, 56))
+
+
+def walkie_loader_masks(world):
+    """Masks robot_bringup.world_loader assigns (a copy of its classification rules).
+
+    The floor plane is 1/32, geoms with contype and conaffinity 0 stay 0/0,
+    geoms that move with a joint are objects (32/121) and the rest furniture (64/56).
+    """
+    expected_masks = {}
+    def walk(element, moving):
+        if element.tag == "body":
+            moving = moving or any(child.tag in {"joint", "freejoint"} for child in element)
+        if element.tag == "geom":
+            if element.get("name") == "floor":
+                mask = (1, 32)
+            elif element.get("contype", "1") == "0" and element.get("conaffinity", "1") == "0":
+                mask = (0, 0)
+            else:
+                mask = (32, 121) if moving else (64, 56)
+            expected_masks[element.get("name")] = mask
+        for child in element:
+            walk(child, moving)
+    walk(world.find("worldbody"), False)
+    return expected_masks
+
+
+# With the Walkie preset, the exported masks are the ones world_loader gives the
+# merged world, so the standalone scene behaves like the merged one.
+walkie_root = ET.parse(OUT / "walkie_masks" / "scene.xml").getroot()
+assert not walkie_root.findall("default"), "the vendored rules ignore default classes"
+for name, mask in walkie_loader_masks(walkie_root).items():
+    geom = walkie.geom(name)
+    assert (int(geom.contype[0]), int(geom.conaffinity[0])) == mask, (name, mask)
 for _ in range(2500):
     mujoco.mj_step(walkie, walkie_data)
 for obj in report["object_details"]:

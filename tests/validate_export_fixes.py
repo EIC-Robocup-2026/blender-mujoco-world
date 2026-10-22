@@ -56,7 +56,7 @@ for source, mass in (("Crate", 2.5), ("Cabinet_door_panel", 6.0), ("Tote_bottom"
     body = model.body(body_of[source]).id
     assert math.isclose(model.body_mass[body], mass, rel_tol=1e-9), (source, model.body_mass[body])
 for name, expected in ((body_of["Crate"], (32, 121)), (body_of["Tote_bottom"], (32, 121)),
-                       (body_of["Cabinet_door_panel"], (64, 56)), (body_of["Wall"], (64, 56))):
+                       (body_of["Cabinet_door_panel"], (32, 121)), (body_of["Wall"], (64, 56))):
     body = model.body(name).id
     colliding = [g for g in range(model.ngeom) if model.geom_bodyid[g] == body and model.geom_contype[g]]
     assert colliding and all(masks(model, g) == expected for g in colliding), (name, [masks(model, g) for g in colliding])

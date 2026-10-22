@@ -89,5 +89,66 @@ _export_simple(bpy.context, str(generic_red))
 assert len(list(shared.iterdir())) == before_repeat
 check_paths(generic_red)
 check_paths(generic_blue)
+
+
+def referenced(path):
+    """Hash of every asset file a world references."""
+    root = ET.parse(path).getroot()
+    compiler = root.find("compiler")
+    hashes = {}
+    for element in root.findall("./asset/*"):
+        if element.get("file"):
+            directory = compiler.get("meshdir" if element.tag == "mesh" else "texturedir", "")
+            resolved = (path.parent / directory / element.get("file")).resolve()
+            hashes[resolved.name] = hashlib.sha256(resolved.read_bytes()).hexdigest()
+    return hashes
+
+
+def export_variant(variant, edit=False):
+    blend, xml, target = variant
+    bpy.ops.wm.open_mainfile(filepath=str(blend))
+    adopt_mjcf(bpy.context, str(xml))
+    bpy.context.scene.mujoco_world.asset_directory = str(shared)
+    bpy.ops.mesh.primitive_cube_add(size=0.2 if edit else 0.1, location=(10, 10, 1))
+    added = bpy.context.object
+    added.name, added.mujoco_world.role = "Shared_export_added_prop", "FREE"
+    if edit:
+        bpy.context.scene.objects["task_apple_1_00"].scale *= 1.5
+    bpy.context.view_layer.update()
+    export_world(bpy.context, str(target))
+    check_paths(target)
+    return referenced(target)
+
+
+def folder_hashes():
+    return {path.name: hashlib.sha256(path.read_bytes()).hexdigest() for path in shared.iterdir()}
+
+
+def mesh_file(path, geom_name):
+    root = ET.parse(path).getroot()
+    mesh = root.find(f".//geom[@name='{geom_name}']").get("mesh")
+    return Path(root.find(f"./asset/mesh[@name='{mesh}']").get("file")).name
+
+
+# Editing one variant never changes a file the other variant references: a
+# name-based asset whose content differs gets a content-addressed name.
+cross_variant = {}
+for untouched, edited in ((variants[0], variants[1]), (variants[1], variants[0])):
+    before = export_variant(untouched)
+    existing = folder_hashes()
+    after_edit = export_variant(edited, edit=True)
+    edited_apple = mesh_file(edited[2], "task_apple_1_00")
+    current = folder_hashes()
+    assert all(current[name] == digest for name, digest in existing.items()), \
+        sorted(name for name, digest in existing.items() if current.get(name) != digest)
+    assert referenced(untouched[2]) == before, sorted(name for name, value in referenced(untouched[2]).items() if before.get(name) != value)
+    unchanged = export_variant(edited)
+    # The edited apple is written under a content name next to the old file,
+    # which the unchanged re-export references again.
+    assert edited_apple.startswith("mesh_") and edited_apple not in unchanged, edited_apple
+    assert mesh_file(edited[2], "task_apple_1_00") == "task_apple_1_00_authored_mesh.obj"
+    assert referenced(untouched[2]) == before
+    cross_variant[untouched[2].parent.name] = edited_apple
 print("SHARED_ASSETS_TEST_OK", json.dumps({"output": str(output), "files_after_each_pair": counts,
+                                           "cross_variant_content_named": cross_variant,
                                            "scenes": [str(v[2]) for v in variants] + [str(generic), str(generic_red), str(generic_blue)]}))

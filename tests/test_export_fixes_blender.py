@@ -84,6 +84,7 @@ scene = fresh_scene()
 settings = scene.mujoco_world
 settings.plane_contype, settings.plane_conaffinity = "0b1", "0x20"
 settings.object_contype, settings.object_conaffinity = "0x40", "0x38"
+settings.hinge_contype, settings.hinge_conaffinity = "0x20", "0x79"
 settings.movable_contype, settings.movable_conaffinity = "0x20", "0x79"
 box("Decorative_floor", (0, 0, -0.01), (3, 3, 0.01), "VISUAL")
 box("Wall", (0, 2.5, 0.5), (2, 0.05, 0.5))
@@ -121,7 +122,10 @@ crate_collision = next(g for g in root.iter("geom") if g.get("name", "").startsw
 assert crate_collision.get("friction") == "0.8 0.005 0.0001", crate_collision.attrib
 assert crate_collision.get("mass") == "2.5", crate_collision.attrib
 cabinet_panel = next(g for g in root.find(".//body[@name='Cabinet_door']").findall("geom") if g.get("contype") != "0")
-assert (cabinet_panel.get("contype"), cabinet_panel.get("conaffinity")) == ("64", "56")
+# Door parts take the door masks, which Walkie's world_loader expects for anything on a joint.
+assert (cabinet_panel.get("contype"), cabinet_panel.get("conaffinity")) == ("32", "121"), cabinet_panel.attrib
+wall = next(g for g in root.iter("geom") if g.get("name", "").startswith("Wall_") and g.get("name").endswith("_collision"))
+assert (wall.get("contype"), wall.get("conaffinity")) == ("64", "56"), wall.attrib
 summary["walkie_door"] = str(walkie_path)
 
 # 2. 'Leave out' on a body group leaves out every part it owns.
