@@ -74,15 +74,23 @@ def is_bake_source(obj):
 def bake_covered(scene):
     """Names of the marked bake sources whose appearance an atlas provides.
 
-    An atlas lists its sources in ``mjworld_bake_sources``. A legacy atlas
-    without that list (the Chula realistic room) covers every marked source.
-    Without an atlas that is exported, nothing is covered, and the exporters
-    write the sources' own visuals again.
+    An atlas references its sources in ``mjworld_bake_source_refs``, a list
+    of objects that follows renames; a deleted source drops out. A copy of a
+    source (Shift+D copies the mark, not the atlas's reference) is not
+    covered, so it exports its own visual. Atlases baked before that list
+    name their sources in ``mjworld_bake_sources``, and a legacy atlas
+    without either list (the Chula realistic room) covers every marked
+    source. Without an atlas that is exported, nothing is covered, and the
+    exporters write the sources' own visuals again.
     """
     marked = {obj.name for obj in scene.objects if is_bake_source(obj)}
     covered = set()
     for atlas in scene.objects:
         if atlas.type != "MESH" or not is_atlas(atlas) or _excluded(atlas) or atlas.get("mjworld_adopted_exclude"):
+            continue
+        refs = atlas.get("mjworld_bake_source_refs")
+        if refs is not None:
+            covered.update(obj.name for obj in refs if isinstance(obj, bpy.types.Object))
             continue
         names = atlas.get("mjworld_bake_sources")
         if names is None:
@@ -147,7 +155,78 @@ def _exists(obj, collection=None):
         return False
 
 
-def _material_copy(source, image, copies):
+def _is_metal(node):
+    """Whether ``node`` is a Metallic BSDF, or a Principled BSDF with a metallic part."""
+    if node.type == "BSDF_METALLIC":
+        return True
+    metallic = node.inputs.get("Metallic") if node.type == "BSDF_PRINCIPLED" else None
+    return metallic is not None and (metallic.is_linked or metallic.default_value != 0.0)
+
+
+def _has_metal(tree, memo):
+    """Whether ``tree`` or a node group inside it has a metal shader; ``memo`` caches by tree."""
+    key = tree.as_pointer()
+    if key not in memo:
+        memo[key] = False  # Blender forbids recursive groups; this only guards the walk.
+        memo[key] = any(_is_metal(node) or (node.type == "GROUP" and node.node_tree is not None
+                                            and _has_metal(node.node_tree, memo)) for node in tree.nodes)
+    return memo[key]
+
+
+def _diffuse_for_metal(tree, node):
+    """Replace the Metallic BSDF ``node`` with a Diffuse BSDF of its base colour."""
+    diffuse = tree.nodes.new("ShaderNodeBsdfDiffuse")
+    diffuse.location = node.location
+    for old, new in (("Base Color", "Color"), ("Normal", "Normal"), ("Weight", "Weight")):
+        source, target = node.inputs.get(old), diffuse.inputs.get(new)
+        if source is None or target is None:
+            continue
+        if source.is_linked:
+            tree.links.new(source.links[0].from_socket, target)
+        elif old == "Base Color":
+            target.default_value = source.default_value
+    for output in node.outputs:
+        for link in list(output.links):
+            tree.links.new(diffuse.outputs["BSDF"], link.to_socket)
+    tree.nodes.remove(node)
+
+
+def _bake_metals_as_diffuse(tree, groups, memo):
+    """Make the private ``tree`` bake every metal's base colour as diffuse albedo.
+
+    A diffuse bake sees (1 - metallic) x base colour, so a metal bakes black.
+    Principled BSDFs get Metallic 0 (unlinked); Metallic BSDFs become Diffuse
+    BSDFs. Node groups with a metal inside are copied once per bake into
+    ``groups`` (original pointer to copy) and the copy is used here, so the
+    user's groups never change. Transmission stays: glass must still let
+    light into the room. A Glossy BSDF stays too; glossy light is not baked.
+    """
+    for node in list(tree.nodes):
+        if node.type == "BSDF_PRINCIPLED" and node.inputs.get("Metallic") is not None:
+            metallic = node.inputs["Metallic"]
+            for link in list(metallic.links):
+                tree.links.remove(link)
+            metallic.default_value = 0.0
+        elif node.type == "BSDF_METALLIC":
+            _diffuse_for_metal(tree, node)
+        elif node.type == "GROUP" and node.node_tree is not None and _has_metal(node.node_tree, memo):
+            key = node.node_tree.as_pointer()
+            if key not in groups:
+                group = node.node_tree.copy()
+                group.name = "MuJoCo bake working group"
+                group["mjworld_generated_bake"] = True
+                groups[key] = group
+                _bake_metals_as_diffuse(group, groups, memo)
+            node.node_tree = groups[key]
+
+
+def _material_copy(source, image, copies, groups=None):
+    """The bake's private copy of material ``source``, rendering into ``image``.
+
+    ``copies`` caches the copies by source material, ``groups`` the private
+    node group copies they use (see _bake_metals_as_diffuse); the caller
+    removes both after the bake.
+    """
     key = source.as_pointer() if source else 0
     if key in copies:
         return copies[key]
@@ -158,15 +237,7 @@ def _material_copy(source, image, copies):
         # Blender 5 always renders through the node tree; 4.x needs it enabled.
         material.use_nodes = True
     tree = material.node_tree
-    for node in tree.nodes:
-        if node.type == "BSDF_PRINCIPLED" and node.inputs.get("Metallic") is not None:
-            # A diffuse bake sees (1 - metallic) x base colour, so a metal
-            # bakes black. Bake its base colour as diffuse albedo instead.
-            # Transmission stays: glass must still let light into the room.
-            metallic = node.inputs["Metallic"]
-            for link in list(metallic.links):
-                tree.links.remove(link)
-            metallic.default_value = 0.0
+    _bake_metals_as_diffuse(tree, {} if groups is None else groups, {})
     target = tree.nodes.new("ShaderNodeTexImage")
     target.name = "MuJoCo atlas bake target"
     target.image = image
@@ -220,6 +291,56 @@ def _copy_shading(source, clone, warnings):
         clone.data.use_auto_texspace = False
         clone.data.texspace_location = data.texspace_location
         clone.data.texspace_size = data.texspace_size
+
+
+def _linking_collections(scene):
+    """Each light linking collection the scene's lights and emitters use, with the pointers of all its objects."""
+    found = {}
+    for obj in scene.objects:
+        linking = getattr(obj, "light_linking", None)
+        if linking is None:
+            continue
+        for collection in (linking.receiver_collection, linking.blocker_collection):
+            if collection is not None and collection.as_pointer() not in found:
+                found[collection.as_pointer()] = (collection, {member.as_pointer() for member in collection.all_objects})
+    return list(found.values())
+
+
+def _link_like_source(source, clone, roots, linked, warnings):
+    """Put the bake clone wherever light linking names its source, with the same link state.
+
+    A light or emissive object can light (receiver collection) or shadow
+    (blocker collection) only chosen objects. The clone stands in for the
+    source during the bake, so it joins every collection in those hierarchies
+    that holds the source directly. ``linked`` collects the (collection,
+    clone) pairs, which _unlink_clones() undoes right after the bake.
+    """
+    pointer = source.as_pointer()
+    for root, members in roots:
+        if pointer not in members:
+            continue
+        for collection in (root, *root.children_recursive):
+            entries = [member.as_pointer() for member in collection.objects]
+            if pointer not in entries or clone.as_pointer() in entries:
+                continue
+            if collection.library is not None or not hasattr(collection, "collection_objects"):
+                warnings.append(f"{source.name}: the light linking collection '{collection.name}' is linked from a "
+                                "library, so the bake could not add this object's copy to it; the atlas may light it "
+                                "as if it were not linked.")
+                continue
+            state = collection.collection_objects[entries.index(pointer)].light_linking.link_state
+            collection.objects.link(clone)
+            linked.append((collection, clone))
+            entries = [member.as_pointer() for member in collection.objects]
+            collection.collection_objects[entries.index(clone.as_pointer())].light_linking.link_state = state
+
+
+def _unlink_clones(linked):
+    """Take the bake clones out of the user's light linking collections again."""
+    for collection, clone in linked:
+        if _exists(clone) and _exists(collection, bpy.data.collections) and clone.name in collection.objects:
+            collection.objects.unlink(clone)
+    linked.clear()
 
 
 def _save_atlases(image, directory):
@@ -307,6 +428,8 @@ def bake_static(context, output_directory, *, atlas_size=2048, samples=128, marg
     previous_atlases = [obj for obj in scene.objects if is_atlas(obj)]
     dynamic_count = sum(1 for obj in scene.objects if obj.type == "MESH" and _dynamic(obj))
     copies, pieces, clone_meshes, baked, skipped, warnings = {}, [], [], [], [], []
+    groups, linked = {}, []
+    linking_roots = _linking_collections(scene)
     image = master = atlas = emission_material = None
     collection = bpy.data.collections.new("MuJoCo baked static visual")
     collection["mjworld_generated_bake"] = True
@@ -335,7 +458,7 @@ def bake_static(context, output_directory, *, atlas_size=2048, samples=128, marg
             mesh.materials.clear()
             slots = [slot.material for slot in source.material_slots] or [None]
             for material in slots:
-                mesh.materials.append(_material_copy(material, image, copies))
+                mesh.materials.append(_material_copy(material, image, copies, groups))
             clone = bpy.data.objects.new("MuJoCo bake piece " + source.name, mesh)
             # Tracked before anything else can fail, so cleanup always finds it.
             pieces.append(clone)
@@ -343,6 +466,7 @@ def bake_static(context, output_directory, *, atlas_size=2048, samples=128, marg
             collection.objects.link(clone)
             clone.matrix_world = source.matrix_world.copy()
             _copy_shading(source, clone, warnings)
+            _link_like_source(source, clone, linking_roots, linked, warnings)
             uv = mesh.uv_layers.new(name="MuJoCoBakeUV")
             if uv is None:
                 raise BakeError(f"{source.name}: the mesh already has the maximum of 8 UV maps; remove one before baking.")
@@ -376,6 +500,8 @@ def bake_static(context, output_directory, *, atlas_size=2048, samples=128, marg
         # screens. Glossy depends on the viewer, so it stays out of the atlas.
         bpy.ops.object.bake(type="COMBINED", pass_filter={"DIFFUSE", "EMIT", "DIRECT", "INDIRECT"},
                             margin=margin, use_clear=True, uv_layer="MuJoCoBakeUV")
+        # The joined atlas must not stay in the user's light linking collections.
+        _unlink_clones(linked)
         master_path, display_path, display_profile = _save_atlases(image, directory)
         master = bpy.data.images.load(str(master_path), check_existing=False)
         master.colorspace_settings.name = "Linear Rec.709"
@@ -413,6 +539,8 @@ def bake_static(context, output_directory, *, atlas_size=2048, samples=128, marg
         atlas.mujoco_world.role = "VISUAL"
         atlas.mujoco_world.baked = True
         atlas["mjworld_baked_atlas"] = True
+        # Object references follow renames; the names are kept for older add-on versions.
+        atlas["mjworld_bake_source_refs"] = list(baked)
         atlas["mjworld_bake_sources"] = [source.name for source in baked]
         atlas["mjworld_bake_passes"] = BAKE_PASSES
         atlas["mjworld_master_exr"] = str(master_path)
@@ -441,6 +569,7 @@ def bake_static(context, output_directory, *, atlas_size=2048, samples=128, marg
     finally:
         if context.mode != "OBJECT":
             bpy.ops.object.mode_set(mode="OBJECT")
+        _unlink_clones(linked)
         scene.render.engine, scene.cycles.samples = previous_engine, previous_samples
         for name, value in previous_bake.items():
             setattr(bake, name, value)
@@ -469,6 +598,9 @@ def bake_static(context, output_directory, *, atlas_size=2048, samples=128, marg
         for material in copies.values():
             if _exists(material, bpy.data.materials):
                 bpy.data.materials.remove(material)
+        for group in groups.values():
+            if _exists(group, bpy.data.node_groups):
+                bpy.data.node_groups.remove(group)
         if _exists(image, bpy.data.images):
             bpy.data.images.remove(image)
         if _exists(collection, bpy.data.collections) and not collection.objects:
