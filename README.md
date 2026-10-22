@@ -1,6 +1,6 @@
 # MuJoCo World — Easy Export
 
-A Blender addon for authoring, baking, and exporting portable MuJoCo environments. It has no Python package dependencies inside Blender. Tested with **Blender 5.2.1 LTS** and **MuJoCo 3.15.0**.
+A Blender addon for authoring, baking, and exporting portable MuJoCo environments. It has no Python package dependencies inside Blender. Tested with **Blender 5.2.1 LTS**, **Blender 4.5.14 LTS** and **MuJoCo 3.15.0**; it declares Blender 4.2 as its minimum.
 
 ## Install once
 
@@ -25,7 +25,11 @@ A Blender addon for authoring, baking, and exporting portable MuJoCo environment
 4. Click **Export world…** and save `scene.xml` in a new folder.
 5. Keep the XML and its `scene_assets/` directory together. The exporter writes a small `export_report.json` with any notes.
 
-Visible mesh objects export by default. Choose **Leave out** to exclude an object, or enable **Export selected objects only**. **Leave out** on a body group Empty also excludes every part inside it. Collision helpers belonging to a bake or adopted world remain exportable while hidden. Blender lights illuminate the static bake; they are not directly converted into MuJoCo lights in a newly authored world.
+Visible mesh objects export by default. Choose **Leave out** to exclude an object, or enable **Export selected objects only**. **Leave out** on a body group Empty also excludes every part inside it. A fixed or visual mesh without faces (guide edges or points) is left out with a note in `export_report.json`. Collision helpers belonging to a bake or adopted world remain exportable while hidden. Blender lights illuminate the static bake; they are not directly converted into MuJoCo lights in a newly authored world.
+
+Folders that start with `//` (the bake folder, a shared asset folder, the export path) are relative to the `.blend` file, so save the file first; until then the add-on refuses them instead of writing next to wherever Blender was started.
+
+Objects linked from another `.blend` file are skipped by the role buttons, **Group selected parts** and **Set hinge at 3D cursor**, because Blender discards edits to linked data on reload. Make a library override first; the MuJoCo object settings are editable on overrides.
 
 Hide such helpers, adopted objects and body group Empties with the eye icon (**Hide in Viewport**). Blender does not update the placement or modifiers of an object that is disabled in viewports (monitor icon) or sits in a collection excluded from the view layer, so the export stops with an error that names those objects instead of writing stale geometry.
 
@@ -80,18 +84,42 @@ Finish the materials and lights, save the project, then click **Bake static
 lighting**. The default creates one **2048 × 2048** diffuse lighting atlas with
 **128 samples** and an **8 px** margin. Set the output folder, resolution, and
 samples under **World advanced settings**. Larger sample counts reduce noise.
+The bake needs the Cycles add-on and a writable bake folder; both are checked
+before the Cycles pass starts. **Ctrl + Z** undoes a bake in one step.
 
-The add-on uses Cycles to bake colour, direct light, and indirect light from
-fixed visual surfaces. It excludes movable objects, doors, and their descendants
-so their current shadows do not become permanent. It retains the original
-geometry and materials for editing and preserves separate physics colliders.
-**Restore sources for editing** brings the original surfaces back; bake again
-after changing them.
+The add-on uses Cycles to bake a Combined pass of diffuse colour and emission,
+with direct and indirect light, from fixed visual surfaces. Emissive panels and
+screens keep their glow. It excludes movable objects, doors, and their
+descendants so their current shadows do not become permanent. It retains the
+original geometry and materials for editing and preserves separate physics
+colliders. Meshes without faces are skipped and listed in the bake report.
+
+> **Metal and glass are approximations.** A diffuse atlas cannot hold
+> view-dependent reflections. The bake treats metallic surfaces as diffuse with
+> their base colour (instead of baking them black), and leaves glossy
+> reflections and transmission out of the atlas. Glass still lets light into
+> the room during the bake.
+
+Bake clones keep the object-level inputs of their sources: object colour, ray
+visibility, holdout and shadow catcher, pass index, light and shadow linking,
+and custom properties read by **Attribute (Object)** nodes. **Object Info →
+Random** cannot be reproduced and produces a note.
+
+**Edit original surfaces** asks for confirmation, then brings the original
+surfaces back and deletes the atlas and its packed lightmap; the EXR and PNG in
+the bake folder stay on disk. Bake again after changing them. A rebake also
+restores any part that it no longer bakes, for example one changed to
+**Movable object**. If the atlas object is deleted by hand, the export writes
+the hidden sources' own visuals again and adds a note.
 
 The output includes a packed half-float linear **EXR master** and an **AgX PNG**.
-The visible static atlas uses an Emission material and has no contact. Moving
-objects continue to use runtime lighting. Export the world after baking; saving
-the Blender file alone does not update MJCF.
+The PNG always uses AgX with look None, exposure 0 and gamma 1 on the sRGB
+display, whatever the scene's view, look, exposure or Output colour management;
+the bake summary and the master image record that profile. Projects baked with
+an earlier version took the scene's look and exposure, so a rebake can change
+their atlas brightness. The visible static atlas uses an Emission material and
+has no contact. Moving objects continue to use runtime lighting. Export the
+world after baking; saving the Blender file alone does not update MJCF.
 
 The current Chula project already contains its white lights and procedural
 materials. Rebaking uses those authored lights and finishes; the add-on contains
@@ -137,17 +165,23 @@ export stops and asks you to rename the original.
 
 ### Image export
 
-Simple flat colours and directly connected UV Image Textures are supported for
-Principled Base Color and Emission. Packed and unsaved images export as PNG.
-For float baked images, the exporter uses the bake's recorded AgX display
-profile, keeping the HDR master unclipped. Ordinary display PNGs retain their
-pixel values. Non-baked HDR albedo needs a saved PNG first.
+Simple flat colours and UV Image Textures are supported for Principled Base
+Color and Emission. Reroute nodes are followed; muted links count as
+unconnected, and a muted shader or image node falls back to the flat colour
+with a note. Packed and unsaved images export as PNG. An image without its own
+UV Map node uses the mesh's render-active UV map, the one Blender renders with.
+
+- **Baked float images** use the bake's recorded AgX display profile, keeping the HDR master unclipped. A float image on an object marked **Image already contains lighting** that has no recorded profile follows the scene's view transform, look, exposure and gamma; the note in `export_report.json` names the profile used.
+- **Ordinary display PNGs** retain their pixel values. An unmodified 16-bit PNG is copied unchanged (MuJoCo reads it as 8-bit).
+- **Other float albedo** (an EXR or an unsaved float buffer) is written as an 8-bit sRGB PNG with a note; values above 1 are clipped and noted.
+- **Non-Color or linear byte images** are re-encoded to sRGB in **Match PNG appearance** mode and tagged `colorspace="linear"` in **sRGB decode** mode, so they keep Blender's brightness. Both modes add a note, because colour textures should use the sRGB colour space.
+- **UDIM (tiled) and missing images** fall back to the flat material colour with a note that names the object, material and image.
 
 ### Why texture colour is explicit
 
 The default **Match PNG appearance** writes `colorspace="linear"` on MuJoCo textures. Here that means *do not decode already display-referred PNG byte values again* in the native viewer. This avoids a saved baked image becoming unexpectedly dark. The native viewer's output is not a complete Blender/AgX colour pipeline, so exact Blender and MuJoCo appearance is not guaranteed.
 
-For a custom renderer that decodes sRGB and applies its own final display transform, choose **sRGB decode (custom renderer)** instead. This decision is explicit rather than depending on a PNG's embedded metadata. See MuJoCo's [texture colour-space reference](https://mujoco.readthedocs.io/en/stable/XMLreference.html#asset-texture-colorspace).
+For a custom renderer that decodes sRGB and applies its own final display transform, choose **sRGB decode (custom renderer)** instead. This decision is explicit rather than depending on a PNG's embedded metadata: Blender 5.2 writes an sRGB chunk into PNGs and 4.5 does not, which would flip MuJoCo's `auto` setting. Adopted exports therefore also write the mode's colour space on retained textures that had none. See MuJoCo's [texture colour-space reference](https://mujoco.readthedocs.io/en/stable/XMLreference.html#asset-texture-colorspace).
 
 ## Open the exported scene
 
@@ -196,7 +230,7 @@ Do not add a second plane named `floor` when merging with a robot scene that alr
 
 This is an environment exporter, not a general Blender physics, URDF or robot exporter. It does not translate Blender rigid-body constraints, animations, Geometry Nodes instances, collection instances, procedural shader graphs, or transparency pipelines. Cycles lighting and procedural colour can be baked into the static atlas. Convert curves/text to mesh and realize instances before export. Hollow movable containers need grouped compound helpers; a single convex collider still fills their cavities.
 
-The included `example.blend` is a small test scene. Additional tests exercise grouped compound bodies, retained imported physics, editable doors/props, and static baking with collision and HDR preservation. `tests/build_smoke_scene.py` generates a fresh export in Blender; `tests/validate_export.py` compiles it in MuJoCo and checks geometry, floor contact policy, preserved weight, texture buffers, selection-only export, portability and the door's torque-driven movement. Results are saved in `tests/output/validation_report.json`; the generated scene is saved as `tests/output/example.blend`, so the tracked `example.blend` is not rewritten. `tests/test_export_fixes_blender.py OUTPUT` and `tests/validate_export_fixes.py OUTPUT [WALKIE_ROS_ROOT]` cover radian angles, inertia settings that merge cleanly with a robot, contact mask formats, body name clashes, excluded body groups, and adopted `fromto` primitives. `tests/test_adopt_blender.py OUTPUT` and `tests/validate_adopt.py OUTPUT` build a small adopted world and cover all-or-nothing adoption, carried mesh inertia, duplicated adopted objects, in-place export, viewport-disabled objects, Weight on adopted bodies, the hinge cursor on shared meshes, failed exports, shared asset folders, and door contact masks. `tests/test_shared_assets_blender.py ROOM OUTPUT` exports both Chula variants into one shared folder; pass a writable copy of the room, because it adopts and exports inside it.
+The included `example.blend` is a small test scene. Additional tests exercise grouped compound bodies, retained imported physics, editable doors/props, and static baking with collision and HDR preservation. `tests/build_smoke_scene.py` generates a fresh export in Blender; `tests/validate_export.py` compiles it in MuJoCo and checks geometry, floor contact policy, preserved weight, texture buffers, selection-only export, portability and the door's torque-driven movement. Results are saved in `tests/output/validation_report.json`; the generated scene is saved as `tests/output/example.blend`, so the tracked `example.blend` is not rewritten. `tests/test_export_fixes_blender.py OUTPUT` and `tests/validate_export_fixes.py OUTPUT [WALKIE_ROS_ROOT]` cover radian angles, inertia settings that merge cleanly with a robot, contact mask formats, body name clashes, excluded body groups, and adopted `fromto` primitives. `tests/test_adopt_blender.py OUTPUT` and `tests/validate_adopt.py OUTPUT` build a small adopted world and cover all-or-nothing adoption, carried mesh inertia, duplicated adopted objects, in-place export, viewport-disabled objects, Weight on adopted bodies, the hinge cursor on shared meshes, failed exports, shared asset folders, and door contact masks. `tests/test_shared_assets_blender.py ROOM OUTPUT` exports both Chula variants into one shared folder; pass a writable copy of the room, because it adopts and exports inside it. `tests/test_review_fixes_blender.py OUTPUT` and `tests/validate_review_fixes.py OUTPUT` cover metal and emission in the bake, the pinned lightmap profile under Override and video output, stale bake marks, bake failure cleanup, faceless meshes, clone shading inputs, the bake's early checks, render-active UV maps, 16-bit/float/UDIM/missing/Non-Color images, reroutes and muted nodes, adopted texture colour spaces, and the operators' linked-data, restore and error handling.
 
 The OBJ/MJCF export uses documented [MuJoCo mesh](https://mujoco.readthedocs.io/en/stable/XMLreference.html#asset-mesh) and [hinge joint](https://mujoco.readthedocs.io/en/stable/XMLreference.html#body-joint) conventions. No external service or asset library is required.
 
