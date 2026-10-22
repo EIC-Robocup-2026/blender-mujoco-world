@@ -339,7 +339,7 @@ def bake_stale_sources():
     # every marked source, as before.
     third = bake_static(bpy.context, str(OUT / "stale_bake"), atlas_size=64, samples=2, margin=1)
     legacy = bpy.data.objects[third["object"]]
-    del legacy["mjworld_bake_sources"]
+    del legacy["mjworld_bake_source_refs"], legacy["mjworld_bake_sources"]
     assert bake_covered(scene) == {"Floor", "A fixed"}
     legacy_path = record("stale_legacy", OUT / "stale_legacy" / "scene.xml")
     report = export_world(bpy.context, str(legacy_path))
@@ -486,6 +486,135 @@ def bake_clone_shading():
     assert red_texels > 20, f"custom property lost: {red_texels} red texels"
     assert any("C random" in w and "Object Info Random" in w for w in result["warnings"]), result["warnings"]
     return {"blue_texels": blue_texels, "red_texels": red_texels}
+
+
+def shader_material(name, kind):
+    """A material whose surface is one new shader node of type ``kind``; returns (material, node)."""
+    result = bpy.data.materials.new(name)
+    if bpy.app.version < (5, 0, 0):
+        result.use_nodes = True
+    tree = result.node_tree
+    for node in list(tree.nodes):
+        if node.type == "BSDF_PRINCIPLED":
+            tree.nodes.remove(node)
+    node = tree.nodes.new(kind)
+    if node.outputs:  # A group node has outputs only once its tree is set.
+        output = next(n for n in tree.nodes if n.type == "OUTPUT_MATERIAL")
+        tree.links.new(node.outputs[0], output.inputs["Surface"])
+    return result, node
+
+
+@section
+def bake_metal_groups():
+    """Metal inside a node group and a Metallic BSDF bake their colour; the user's group is untouched."""
+    bake_scene()
+    box("Floor", (0, 0, -0.05), (1.5, 1.5, 0.05), "VISUAL", material("grey", (0.3, 0.3, 0.3)))
+    group = bpy.data.node_groups.new("Green metal group", "ShaderNodeTree")
+    group.interface.new_socket("Shader", in_out="OUTPUT", socket_type="NodeSocketShader")
+    group_output = group.nodes.new("NodeGroupOutput")
+    inner = group.nodes.new("ShaderNodeBsdfPrincipled")
+    inner.inputs["Base Color"].default_value = (0.05, 0.9, 0.05, 1)
+    inner.inputs["Metallic"].default_value = 1.0
+    group.links.new(inner.outputs["BSDF"], group_output.inputs[0])
+    grouped, group_node = shader_material("grouped metal", "ShaderNodeGroup")
+    group_node.node_tree = group
+    output = next(n for n in grouped.node_tree.nodes if n.type == "OUTPUT_MATERIAL")
+    grouped.node_tree.links.new(group_node.outputs[0], output.inputs["Surface"])
+    box("Group metal", (-0.5, 0, 0.3), (0.25, 0.25, 0.25), mat=grouped)
+    metallic, metal_node = shader_material("metallic bsdf", "ShaderNodeBsdfMetallic")
+    metal_node.inputs["Base Color"].default_value = (0.9, 0.05, 0.03, 1)
+    box("Metal BSDF", (0.5, 0, 0.3), (0.25, 0.25, 0.25), mat=metallic)
+    groups_before = sorted(g.name for g in bpy.data.node_groups)
+    result = bake_static(bpy.context, str(OUT / "metal_groups_bake"), atlas_size=64, samples=2, margin=1)
+    pixels = texels(atlas_image(result))
+    green = sum(1 for r, g, b, _a in pixels if g > 0.3 and g > 3 * r and g > 3 * b)
+    red = sum(1 for r, g, b, _a in pixels if r > 0.3 and r > 3 * g and r > 3 * b)
+    assert green > 30, f"metal inside a node group baked black: {green} green texels"
+    assert red > 30, f"Metallic BSDF baked black: {red} red texels"
+    assert sorted(g.name for g in bpy.data.node_groups) == groups_before, "a working node group was left behind"
+    assert inner.inputs["Metallic"].default_value == 1.0 and group_node.node_tree == group
+    assert any(node.type == "BSDF_METALLIC" for node in metallic.node_tree.nodes)
+    return {"green_texels": green, "red_texels": red}
+
+
+def link_states(collection):
+    """(object name, link state) of every object directly in ``collection``."""
+    return [(obj.name, entry.light_linking.link_state)
+            for obj, entry in zip(collection.objects, collection.collection_objects)]
+
+
+@section
+def bake_light_linking():
+    """Bake clones join their sources' light linking collections with the same state, and leave them afterwards."""
+    scene = bake_scene(strength=0.0)
+    red = box("Red lit", (-0.6, 0, 0.3), (0.2, 0.2, 0.2), mat=material("red", (0.8, 0.1, 0.1)))
+    blue = box("Blue excluded", (0.6, 0, 0.3), (0.2, 0.2, 0.2), mat=material("blue", (0.1, 0.1, 0.8)))
+    many = box("Many UV maps", (0, 0.8, 0.3), (0.2, 0.2, 0.2), mat=material("grey", (0.5, 0.5, 0.5)))
+    for index in range(7):
+        many.data.uv_layers.new(name=f"extra_{index}")
+    receivers = bpy.data.collections.new("Lamp receivers")
+    for obj in (red, blue, many):
+        receivers.objects.link(obj)
+    receivers.collection_objects[list(receivers.objects).index(blue)].light_linking.link_state = "EXCLUDE"
+    lamp = bpy.data.objects.new("Lamp", bpy.data.lights.new("Lamp", "POINT"))
+    lamp.data.energy = 300
+    scene.collection.objects.link(lamp)
+    lamp.location = (0, 0, 1.2)
+    lamp.light_linking.receiver_collection = receivers
+    before = link_states(receivers)
+    # A failed bake takes the clones out again.
+    try:
+        bake_static(bpy.context, str(OUT / "light_linking_bake"), atlas_size=64, samples=2, margin=1)
+    except BakeError as exc:
+        assert "8 UV maps" in str(exc), str(exc)
+    else:
+        raise AssertionError("a ninth UV map was accepted")
+    assert link_states(receivers) == before, link_states(receivers)
+    bpy.data.objects.remove(many)
+    before = link_states(receivers)
+    result = bake_static(bpy.context, str(OUT / "light_linking_bake"), atlas_size=64, samples=2, margin=1)
+    assert link_states(receivers) == before, link_states(receivers)
+    pixels = texels(atlas_image(result))
+    lit_red = sum(1 for r, g, b, _a in pixels if r > 1 and r > 3 * g)
+    lit_blue = sum(1 for r, g, b, _a in pixels if b > 1 and b > 3 * r)
+    assert lit_red > 20, f"the lamp's receiver lost its light: {lit_red} lit red texels"
+    assert lit_blue <= max(2, lit_red // 20), f"the excluded object was lit: {lit_blue} lit blue texels"
+    return {"lit_red": lit_red, "lit_blue": lit_blue, "states": before}
+
+
+@section
+def bake_source_refs():
+    """The atlas follows a renamed source; a copy of a source exports its own visual, with a warning."""
+    scene = bake_scene()
+    box("Floor", (0, 0, -0.05), (1.5, 1.5, 0.05), "VISUAL", material("grey", (0.3, 0.3, 0.3)))
+    a = box("A fixed", (-0.5, 0, 0.3), (0.2, 0.2, 0.2), mat=material("red", (0.8, 0.1, 0.1)))
+    box("B fixed", (0.5, 0, 0.3), (0.2, 0.2, 0.2), mat=material("blue", (0.1, 0.1, 0.8)))
+    result = bake_static(bpy.context, str(OUT / "refs_bake"), atlas_size=64, samples=2, margin=1)
+    a.name = "A renamed"
+    assert bake_covered(scene) == {"Floor", "A renamed", "B fixed"}, bake_covered(scene)
+    renamed = record("refs_renamed", OUT / "refs_renamed" / "scene.xml")
+    report = export_world(bpy.context, str(renamed))
+    assert not visual_geoms(renamed, "A_renamed_"), "the renamed source exported its visual beside the atlas"
+    assert not [w for w in report["warnings"] if "marked as a bake source" in w], report["warnings"]
+    # Shift+D copies the object with its ID properties (the bake mark) and links its mesh.
+    copy = a.copy()
+    scene.collection.objects.link(copy)
+    copy.location.y += 1.0
+    bpy.context.view_layer.update()
+    assert copy.get("mjworld_bake_source") and copy.name not in bake_covered(scene)
+    copied = record("refs_copied", OUT / "refs_copied" / "scene.xml")
+    report = export_world(bpy.context, str(copied))
+    assert len(visual_geoms(copied, "A_renamed.001_")) == 1 and not visual_geoms(copied, "A_renamed_")
+    notes = [w for w in report["warnings"] if "marked as a bake source" in w]
+    assert len(notes) == 1 and notes[0].startswith("A renamed.001: marked as a bake source, but no baked atlas"), notes
+    # A deleted source drops out; an atlas from before the reference list uses its names.
+    bpy.data.objects.remove(copy)
+    bpy.data.objects.remove(scene.objects["B fixed"])
+    assert bake_covered(scene) == {"Floor", "A renamed"}, bake_covered(scene)
+    atlas = bpy.data.objects[result["object"]]
+    del atlas["mjworld_bake_source_refs"]
+    assert bake_covered(scene) == {"Floor"}, bake_covered(scene)
+    return {"atlas": result["object"]}
 
 
 @section
@@ -640,6 +769,92 @@ def texture_images():
     assert any(n.startswith("G muted node / muted node: Colour node") and "muted" in n for n in notes), notes
     assert not any(n.startswith("E reroute") for n in notes), notes
     return {"notes": notes}
+
+
+def emission_material(name, image):
+    """An Emission shader whose colour is ``image``, as an imported lightmap is set up."""
+    result, emission = shader_material(name, "ShaderNodeEmission")
+    node = result.node_tree.nodes.new("ShaderNodeTexImage")
+    node.image = image
+    result.node_tree.links.new(node.outputs["Color"], emission.inputs["Color"])
+    return result
+
+
+EMISSIVE = """<mujoco model="emissive">
+  <compiler angle="radian"/>
+  <worldbody>
+    <geom name="floor" type="plane" size="5 5 0.1"/>
+    <geom name="Screen" type="box" size="0.2 0.2 0.2" pos="0 0 0.2"/>
+    <geom name="Panel" type="box" size="0.2 0.2 0.2" pos="1 0 0.2"/>
+  </worldbody>
+</mujoco>
+"""
+
+
+@section
+def emission_png16():
+    """A 16-bit PNG lightmap in Emission is copied unchanged; only an HDR (EXR) one is converted, with a note."""
+    folder = OUT / "emission_sources"
+    folder.mkdir()
+    png16 = folder / "light16.png"
+    write_png16(png16, 4, 4, lambda x, y: (40000, 20000 + 4000 * x, 10000 * y))
+    exr = folder / "light.exr"
+
+    def images():
+        deep = bpy.data.images.load(str(png16))
+        assert deep.is_float and deep.file_format == "PNG", (deep.is_float, deep.file_format)
+        source = bpy.data.images.new("light hdr", 4, 4, float_buffer=True)
+        source.pixels[:] = [2.0, 1.0, 0.5, 1] * 16
+        source.filepath_raw, source.file_format = str(exr), "OPEN_EXR"
+        source.save()
+        return emission_material("deep emission", deep), emission_material("exr emission", bpy.data.images.load(str(exr)))
+
+    def hdr_notes(report):
+        return [w for w in report["warnings"] if "HDR bake" in w]
+
+    results = {}
+    # Ordinary export.
+    fresh_scene()
+    deep, hdr = images()
+    box("A deep emission", (-0.5, 0, 0.3), (0.2, 0.2, 0.2), mat=deep)
+    box("B exr emission", (0.5, 0, 0.3), (0.2, 0.2, 0.2), mat=hdr)
+    target = record("emission_png16", OUT / "emission_png16" / "scene.xml")
+    report = export_world(bpy.context, str(target))
+    root = xml(target)
+    materials = {m.get("name"): m for m in root.iter("material")}
+    textures = {t.get("name"): t for t in root.iter("texture")}
+    files = {prefix: texture_file(target, textures[materials[visual_geoms(target, prefix)[0].get("material")].get("texture")])
+             for prefix in ("A_deep_emission", "B_exr_emission")}
+    assert files["A_deep_emission"].read_bytes() == png16.read_bytes(), "the 16-bit PNG lightmap was converted"
+    notes = hdr_notes(report)
+    assert len(notes) == 1 and notes[0].startswith("B exr emission: HDR bake"), notes
+    results["ordinary"] = notes
+    # Adopted export: the authored-material path.
+    fresh_scene()
+    directory = OUT / "emission_adopted"
+    directory.mkdir()
+    (directory / "source.xml").write_text(EMISSIVE)
+    bpy.ops.mesh.primitive_plane_add(size=10)
+    bpy.context.object.name = "floor"
+    screen = box("Screen", (0, 0, 0.2), (0.2, 0.2, 0.2))
+    panel = box("Panel", (1, 0, 0.2), (0.2, 0.2, 0.2))
+    bpy.context.view_layer.update()
+    adopt_mjcf(bpy.context, str(directory / "source.xml"))
+    deep, hdr = images()
+    screen.data.materials.append(deep)
+    panel.data.materials.append(hdr)
+    target = record("emission_adopted", directory / "scene.xml")
+    report = export_world(bpy.context, str(target))
+    root = xml(target)
+    materials = {m.get("name"): m for m in root.iter("material")}
+    textures = {t.get("name"): t for t in root.iter("texture")}
+    screen_geom = root.find(".//geom[@name='Screen']")
+    screen_file = target.parent / textures[materials[screen_geom.get("material")].get("texture")].get("file")
+    assert screen_file.read_bytes() == png16.read_bytes(), "the adopted 16-bit PNG lightmap was converted"
+    notes = hdr_notes(report)
+    assert len(notes) == 1 and notes[0].startswith("Panel: HDR bake"), notes
+    results["adopted"] = notes
+    return results
 
 
 @section

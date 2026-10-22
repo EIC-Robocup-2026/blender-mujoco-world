@@ -15,6 +15,9 @@
 #   WALKIE_ROS_ROOT    Optional walkie-ros checkout. The smoke and export-fix
 #                      worlds are then merged with the Walkie robot through a
 #                      copy of its world loader. The checkout is only read.
+#                      When its loader cannot be used, the walkie_* steps fail.
+#   MJWORLD_ALLOW_WALKIE_SKIP
+#                      Set to 1 to report an unusable loader as SKIP instead.
 #   MJWORLD_ROOM_ROOT  Optional existing room project (scene.xml,
 #                      chula_pat14_6.blend, realistic/scene.xml,
 #                      realistic/realistic.blend). The tests use a copy in
@@ -122,15 +125,48 @@ test_pair() {
     fi
 }
 
+passed() {
+    local step
+    for step in ${PASSED[@]+"${PASSED[@]}"}; do
+        [[ $step == "$1" ]] && return 0
+    done
+    return 1
+}
+
+# walkie_check NAME MARKER: the Walkie merge inside validate_NAME. A validator
+# prints MARKER and passes when it could not use the walkie-ros world loader;
+# with WALKIE_ROS_ROOT set, that is a failure unless MJWORLD_ALLOW_WALKIE_SKIP=1.
+walkie_check() {
+    local name=walkie_$1 marker=$2 log="$OUT/logs/validate_$1.log" reason
+    if [[ -z "$WALKIE_ROS_ROOT" ]]; then
+        skip_step "$name" "WALKIE_ROS_ROOT not set"
+    elif ! passed "validate_$1"; then
+        skip_step "$name" "validate_$1 did not pass"
+    elif ! grep -q "^$marker" "$log"; then
+        printf '%-26s PASS\n' "$name"
+        PASSED+=("$name")
+    else
+        reason="$(grep -m 1 "^$marker" "$log" | cut -d ' ' -f 2-)"
+        if [[ "${MJWORLD_ALLOW_WALKIE_SKIP:-}" == 1 ]]; then
+            skip_step "$name" "$reason"
+        else
+            printf '%-26s FAIL  (%s; set MJWORLD_ALLOW_WALKIE_SKIP=1 to allow)\n' "$name" "$reason"
+            FAILED+=("$name")
+        fi
+    fi
+}
+
 tree_state() {
     git -C "$ROOT" status --porcelain --ignored --untracked-files=all
 }
 
 package_reproducible() {
-    # Two builds of the same sources must be byte-identical.
+    # Two builds of the same sources must be byte-identical, and hold exactly
+    # the add-on's files with fixed metadata.
     "$PYTHON" -I -B "$ROOT/package_addon.py" --output "$OUT/dist/first" \
         && "$PYTHON" -I -B "$ROOT/package_addon.py" --output "$OUT/dist/second" \
-        && cmp "$OUT"/dist/first/mujoco_world-*.zip "$OUT"/dist/second/mujoco_world-*.zip
+        && cmp "$OUT"/dist/first/mujoco_world-*.zip "$OUT"/dist/second/mujoco_world-*.zip \
+        && "$PYTHON" -I -B "$TESTS/check_package.py" "$OUT"/dist/first/mujoco_world-*.zip
 }
 
 install_check() {
@@ -155,10 +191,12 @@ fi
 
 test_pair smoke build_smoke_scene.py "$OUT/smoke" -- \
     validate_export.py "$OUT/smoke" ${walkie_args[@]+"${walkie_args[@]}"}
+walkie_check smoke WALKIE_CONSUMER_PARITY_SKIPPED
 test_pair bake test_baking_blender.py "$OUT/bake" -- validate_compile.py bake "$OUT/bake"
 test_pair compound test_compound_blender.py "$OUT/compound" -- validate_compound.py "$OUT/compound"
 test_pair export_fixes test_export_fixes_blender.py "$OUT/export_fixes" -- \
     validate_export_fixes.py "$OUT/export_fixes" ${walkie_args[@]+"${walkie_args[@]}"}
+walkie_check export_fixes WALKIE_MERGE_SKIPPED
 test_pair adopt test_adopt_blender.py "$OUT/adopt" -- validate_adopt.py "$OUT/adopt"
 test_pair review_fixes test_review_fixes_blender.py "$OUT/review_fixes" -- \
     validate_review_fixes.py "$OUT/review_fixes"

@@ -25,6 +25,7 @@ import harness  # noqa: E402
 
 OUT, _ = harness.begin("adopt")
 import mujoco_world  # noqa: E402
+from mujoco_world import exporter  # noqa: E402
 from mujoco_world.exporter import ExportError, export_world  # noqa: E402
 from mujoco_world.project import adopt_mjcf, group_selected  # noqa: E402
 
@@ -664,6 +665,170 @@ def door_masks():
     assert found[door] == ("32", "121") and found["floor"] == ("1", "32"), found
     assert next(value for name, value in found.items() if name.startswith("Wall_")) == ("64", "56"), found
     return {"blank": str(blank), "walkie": str(walkie)}
+
+
+@section
+def per_xml_in_shared_folder():
+    """A per-XML export whose folder another world uses as its shared folder replaces none of that world's files."""
+    directory = OUT / "per_xml_shared"
+    adopt(directory / "source")
+    scene = bpy.context.scene
+    out = directory / "export"
+    shared = out / "scene_assets"
+    scene.mujoco_world.asset_directory = str(shared)
+    first = out / "shared" / "scene.xml"
+    export_world(bpy.context, str(first))
+    first_files = referenced(first)
+    # The per-XML folder of out/scene.xml is out/scene_assets: the same folder.
+    scene.mujoco_world.asset_directory = ""
+    scene.objects["Bin_solid"].scale = (1.2, 1.2, 1.2)
+    bpy.context.view_layer.update()
+    second = out / "scene.xml"
+    export_world(bpy.context, str(second))
+    assert referenced(first) == first_files, "the per-XML export changed the shared world's files"
+    second_files = referenced(second)
+    edited = second_files.pop("Bin_solid_authored_mesh")
+    assert edited[0].startswith("mesh_") and edited != first_files["Bin_solid_authored_mesh"], edited
+    unchanged = {name: value for name, value in first_files.items() if name != "Bin_solid_authored_mesh"}
+    assert second_files == unchanged, (second_files, unchanged)
+    manifest = shared / ".mujoco_world_manifest.json"
+    # Identical files are referenced as they are; only the file this world wrote is its own.
+    assert json.loads(manifest.read_text())["files"] == [edited[0]], manifest.read_text()
+    # The next per-XML export removes its own previous file, still none of the shared world's.
+    scene.objects["Bin_solid"].scale = (1.4, 1.4, 1.4)
+    bpy.context.view_layer.update()
+    export_world(bpy.context, str(second))
+    again = referenced(second)["Bin_solid_authored_mesh"]
+    assert again[0].startswith("mesh_") and again != edited, again
+    assert not (shared / edited[0]).exists(), "the per-XML world's own stale file was kept"
+    assert referenced(first) == first_files, "the second per-XML export changed the shared world's files"
+    assert json.loads(manifest.read_text())["files"] == [again[0]], manifest.read_text()
+    assert not leftovers(directory), leftovers(directory)
+    return {"shared": str(first), "per_xml": str(second), "content_named": again[0]}
+
+
+@section
+def failed_xml_install():
+    """When the new XML cannot be installed, the old XML, its report and every file it names stay."""
+    directory = OUT / "failed_install"
+    original = exporter._install
+
+    def broken(temporary, path):
+        if Path(path).suffix == ".xml":
+            raise OSError("simulated XML install failure")
+        original(temporary, path)
+
+    def attempt(target):
+        bpy.context.view_layer.update()
+        exporter._install = broken
+        try:
+            export_world(bpy.context, str(target))
+        except OSError as exc:
+            assert "simulated XML install failure" in str(exc), str(exc)
+        else:
+            raise AssertionError("the simulated install failure did not stop the export")
+        finally:
+            exporter._install = original
+
+    def check(target, old_xml, old_report):
+        assert target.read_bytes() == old_xml, "the old XML was replaced"
+        assert (target.parent / "export_report.json").read_bytes() == old_report, "the old report was replaced"
+        missing = [str(path) for path in resolved_assets(target).values() if not path.is_file()]
+        assert not missing, f"files the old XML names were removed: {missing}"
+        assert not leftovers(directory), leftovers(directory)
+
+    def folder_matches(target):
+        """The asset folder holds exactly the files the XML names, plus the manifest."""
+        folder = target.parent / "scene_assets"
+        files = sorted(p.name for p in folder.iterdir() if p.name != ".mujoco_world_manifest.json")
+        named = sorted({path.name for path in resolved_assets(target).values()})
+        assert files == named, (files, named)
+        assert json.loads((folder / ".mujoco_world_manifest.json").read_text())["files"] == named
+        return named
+
+    results = {}
+    # Ordinary export: a renamed object writes new files, a deleted one leaves stale files.
+    fresh_scene()
+    box("Crate", (0, 0, 0.3), (0.2, 0.2, 0.2), "FREE")
+    box("Stool", (1, 0, 0.3), (0.2, 0.2, 0.2), "FREE")
+    simple = directory / "simple" / "scene.xml"
+    export_world(bpy.context, str(simple))
+    old = simple.read_bytes(), (simple.parent / "export_report.json").read_bytes()
+    bpy.context.scene.objects["Crate"].name = "Crate_renamed"
+    bpy.data.objects.remove(bpy.context.scene.objects["Stool"])
+    attempt(simple)
+    check(simple, *old)
+    export_world(bpy.context, str(simple))
+    results["simple"] = folder_matches(simple)
+    # Adopted export: a regenerated mesh and a deleted visual.
+    adopt(directory / "adopted_source")
+    adopted = directory / "adopted" / "scene.xml"
+    export_world(bpy.context, str(adopted))
+    old = adopted.read_bytes(), (adopted.parent / "export_report.json").read_bytes()
+    bpy.context.scene.objects["Bin_solid"].scale = (1.5, 1.5, 1.5)
+    bpy.data.objects.remove(bpy.context.scene.objects["Bin_skin"])
+    attempt(adopted)
+    check(adopted, *old)
+    export_world(bpy.context, str(adopted))
+    results["adopted"] = folder_matches(adopted)
+    return results
+
+
+PART_NAMES = """<mujoco model="part_names">
+  <compiler angle="radian"/>
+  <worldbody>
+    <geom name="floor" type="plane" size="5 5 0.1"/>
+    <body name="Lamp_000" pos="1 0 0.3">
+      <freejoint name="Lamp_000_free"/>
+      <geom name="Lamp_000_box" type="box" size="0.1 0.1 0.1" mass="1"/>
+    </body>
+    <body name="Shelf" pos="-1 0 0.5">
+      <geom name="Shelf_board" type="box" size="0.3 0.2 0.02"/>
+      <geom name="Book_000_collision" type="box" size="0.05 0.05 0.05" pos="0.2 0 0.07"/>
+    </body>
+  </worldbody>
+</mujoco>
+"""
+
+
+@section
+def new_part_names():
+    """New objects whose MJCF names the adopted world already uses are refused before anything is written."""
+    directory = OUT / "part_names"
+    source = directory / "source" / "scene.xml"
+    source.parent.mkdir(parents=True)
+    source.write_text(PART_NAMES)
+    fresh_scene()
+    bpy.ops.mesh.primitive_plane_add(size=10)
+    bpy.context.object.name = "floor"
+    lamp_body = empty("Lamp_000", (1, 0, 0.3))
+    box("Lamp_000_box", (1, 0, 0.3), (0.1, 0.1, 0.1), parent=lamp_body)
+    shelf = empty("Shelf", (-1, 0, 0.5))
+    box("Shelf_board", (-1, 0, 0.5), (0.3, 0.2, 0.02), parent=shelf)
+    box("Book_000_collision", (-0.8, 0, 0.57), (0.05, 0.05, 0.05), parent=shelf)
+    bpy.context.view_layer.update()
+    adopt_mjcf(bpy.context, str(source))
+    messages = {}
+    # A new top-level movable object: its body and free joint names are taken.
+    lamp = box("Lamp", (2, 0, 0.3), (0.1, 0.1, 0.1), "FREE")
+    messages["body"] = expect_error("'Lamp' (body 'Lamp_000')", directory / "body" / "scene.xml")
+    assert "'Lamp' (freejoint 'Lamp_000_free')" in messages["body"], messages["body"]
+    lamp.name = "Lantern"
+    # A new part grouped into an adopted body: its geoms join that body.
+    book = box("Book", (-0.6, 0, 0.6), (0.05, 0.05, 0.05), parent=shelf)
+    messages["grouped"] = expect_error("'Book' (geom 'Book_000_collision')", directory / "grouped" / "scene.xml")
+    assert "Lantern" not in messages["grouped"], messages["grouped"]
+    book.name = "Novel"
+    target = directory / "scene.xml"
+    export_world(bpy.context, str(target))
+    root = xml(target)
+    for tag in ("body", "geom", "freejoint", "joint", "site"):
+        names = [element.get("name") for element in root.iter(tag) if element.get("name")]
+        assert len(names) == len(set(names)), (tag, names)
+    shelf_geoms = [geom.get("name") for geom in root.find(".//body[@name='Shelf']").findall("geom")]
+    assert any(name.startswith("Novel_") for name in shelf_geoms), shelf_geoms
+    assert root.find(".//body[@name='Lantern_000']") is not None
+    return {"messages": messages, "export": str(target)}
 
 
 (OUT / "adopt_summary.json").write_text(json.dumps(summary, indent=2, default=str) + "\n")

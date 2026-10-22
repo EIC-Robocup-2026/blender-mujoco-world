@@ -13,6 +13,7 @@ with every failing section listed.
 import hashlib
 import importlib
 import json
+import math
 from pathlib import Path
 import struct
 import sys
@@ -22,7 +23,7 @@ import zlib
 
 import bmesh
 import bpy
-from mathutils import Matrix
+from mathutils import Matrix, Quaternion
 
 sys.dont_write_bytecode = True  # Blender ignores PYTHONDONTWRITEBYTECODE.
 sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -870,6 +871,173 @@ def rebake_names():
                 "materials": ["MuJoCo baked static lighting"], "collections": ["MuJoCo baked static visual"]}
     assert rounds == [expected, expected], rounds
     return rounds
+
+
+DOORS = """<mujoco model="door_orientations">
+  <compiler angle="radian"/>
+  <worldbody>
+    <geom name="floor" type="plane" size="5 5 0.1"/>
+    <body name="Euler_door" pos="0 1 0.5" euler="0 0 0.5">
+      <joint name="Euler_hinge" type="hinge" axis="0 0 1" range="-1.5 0"/>
+      <geom name="Euler_panel" type="box" size="0.3 0.02 0.4" pos="0.3 0 0" mass="5"/>
+    </body>
+    <body name="Axes_door" pos="2 1 0.5" xyaxes="0 1 0 -1 0 0">
+      <joint name="Axes_hinge" type="hinge" axis="0 0 1" range="-1.5 0"/>
+      <geom name="Axes_panel" type="box" size="0.3 0.02 0.4" pos="0.3 0 0" mass="5"/>
+    </body>
+  </worldbody>
+</mujoco>
+"""
+
+
+@section
+def door_orientations():
+    """A new starting angle on a door oriented by euler or xyaxes writes one orientation, the quaternion."""
+    directory = OUT / "door_orientations"
+    source = write_world(directory / "source", DOORS)
+    fresh_scene()
+    floor()
+    for name, pos, angle in (("Euler", (0, 1, 0.5), 0.5), ("Axes", (2, 1, 0.5), 1.5707963267948966)):
+        owner = empty(name + "_door", pos)
+        owner.rotation_euler = (0, 0, angle)
+        bpy.ops.mesh.primitive_cube_add(size=2)
+        panel = bpy.context.object
+        panel.name, panel.parent = name + "_panel", owner
+        panel.location, panel.scale = (0.3, 0, 0), (0.3, 0.02, 0.4)
+    bpy.context.view_layer.update()
+    adopt_mjcf(bpy.context, str(source))
+    scene = bpy.context.scene
+    for name in ("Euler_door", "Axes_door"):
+        cfg = scene.objects[name].mujoco_world
+        assert cfg.role == "HINGE" and abs(cfg.hinge_start) < 1e-6, (name, cfg.role, cfg.hinge_start)
+        cfg.hinge_start = -30
+    target = directory / "scene.xml"
+    export(target, "door_orientations")
+    root = xml(target)
+    expected = {}
+    for name, angle in (("Euler_door", 0.5), ("Axes_door", 1.5707963267948966)):
+        body = root.find(f".//body[@name='{name}']")
+        assert not {"euler", "xyaxes", "axisangle", "zaxis"} & set(body.attrib), body.attrib
+        quat = Quaternion(floats(body.get("quat")))
+        wanted = Quaternion((0, 0, 1), angle) @ Quaternion((0, 0, 1), math.radians(-30))
+        assert abs(abs(quat.dot(wanted)) - 1) < 1e-6, (name, list(quat), list(wanted))
+        joint = body.find("joint")
+        assert abs(float(joint.get("ref")) - math.radians(-30)) < 1e-6, joint.attrib
+        expected[name] = list(wanted)
+    return expected
+
+
+LAYERED = """<mujoco model="layered">
+  <compiler angle="radian"/>
+  <asset>
+    <texture name="wood" type="2d" file="wood.png"/>
+    <texture name="old_tex" type="2d" file="old.png"/>
+    <material name="wood_mat"><layer texture="wood" role="rgb"/></material>
+    <material name="old_mat" texture="old_tex"/>
+  </asset>
+  <worldbody>
+    <geom name="floor" type="plane" size="5 5 0.1"/>
+    <geom name="Crate" type="box" size="0.2 0.2 0.2" pos="0 0 0.2" material="wood_mat"/>
+    <geom name="Old" type="box" size="0.2 0.2 0.2" pos="1 0 0.2" material="old_mat"/>
+  </worldbody>
+</mujoco>
+"""
+
+
+@section
+def layered_material():
+    """A texture named by a material layer is kept; one only an unused material named goes with it."""
+    directory = OUT / "layered"
+    source = write_world(directory / "source", LAYERED)
+    png(directory / "source" / "wood.png", rgb=(160, 110, 50))
+    png(directory / "source" / "old.png", rgb=(20, 20, 200))
+    fresh_scene()
+    floor()
+    box("Crate", (0, 0, 0.2), (0.2, 0.2, 0.2))
+    box("Old", (1, 0, 0.2), (0.2, 0.2, 0.2))
+    adopt_mjcf(bpy.context, str(source))
+    bpy.data.objects.remove(bpy.context.scene.objects["Old"])
+    target = directory / "scene.xml"
+    export(target, "layered")
+    root = xml(target)
+    textures = {element.get("name"): element for element in root.iter("texture")}
+    materials = {element.get("name"): element for element in root.iter("material")}
+    assert set(textures) == {"wood"} and set(materials) == {"wood_mat"}, (sorted(textures), sorted(materials))
+    assert [layer.attrib for layer in materials["wood_mat"]] == [{"texture": "wood", "role": "rgb"}]
+    assert (target.parent / textures["wood"].get("file")).read_bytes() == (directory / "source" / "wood.png").read_bytes()
+    folder = target.parent / "scene_assets"
+    left = sorted(p.name for p in folder.iterdir() if not p.name.startswith("."))
+    assert left == [Path(textures["wood"].get("file")).name], left
+    return {"files": left}
+
+
+COPY_NAMES = """<mujoco model="copy_names">
+  <compiler angle="radian"/>
+  <asset>
+    <hfield name="terrain" file="terrain.png" size="1 1 0.1 0.05"/>
+    <texture name="terrain" type="2d" file="terrain_colour.png"/>
+    <hfield name="bumps" file="bumps.png" size="1 1 0.1 0.05"/>
+    <texture name="bumps" type="2d" file="bumps.png"/>
+    <texture name="a b" type="2d" file="first.png"/>
+    <texture name="a_b" type="2d" file="second.png"/>
+    <material name="terrain_mat" texture="terrain"/>
+    <material name="first_mat" texture="a b"/>
+    <material name="second_mat" texture="a_b"/>
+  </asset>
+  <worldbody>
+    <geom name="floor" type="plane" size="5 5 0.1"/>
+    <geom name="Ground" type="box" size="0.2 0.2 0.2" pos="0 0 0.2" material="terrain_mat"/>
+    <geom name="First" type="box" size="0.2 0.2 0.2" pos="1 0 0.2" material="first_mat"/>
+    <geom name="Second" type="box" size="0.2 0.2 0.2" pos="2 0 0.2" material="second_mat"/>
+  </worldbody>
+</mujoco>
+"""
+
+
+@section
+def copy_name_collisions():
+    """Adopted files whose copies would share a name keep their own content; a shared file stays while named."""
+    directory = OUT / "copy_names"
+    source_dir = directory / "source"
+    source = write_world(source_dir, COPY_NAMES)
+    sources = {("hfield", "terrain"): "terrain.png", ("texture", "terrain"): "terrain_colour.png",
+               ("hfield", "bumps"): "bumps.png", ("texture", "a b"): "first.png", ("texture", "a_b"): "second.png"}
+    png(source_dir / "terrain.png", rgb=(90, 0, 0), gray=True)
+    png(source_dir / "terrain_colour.png", rgb=(30, 160, 40))
+    png(source_dir / "bumps.png", rgb=(200, 0, 0), gray=True)
+    png(source_dir / "first.png", rgb=(200, 40, 40))
+    png(source_dir / "second.png", rgb=(40, 40, 200))
+    fresh_scene()
+    floor()
+    for name, x in (("Ground", 0), ("First", 1), ("Second", 2)):
+        box(name, (x, 0, 0.2), (0.2, 0.2, 0.2))
+    adopt_mjcf(bpy.context, str(source))
+    results = {}
+    for mode, shared in (("per_xml", None), ("shared", directory / "shared" / "scene_assets")):
+        bpy.context.scene.mujoco_world.asset_directory = str(shared) if shared else ""
+        target = directory / mode / "scene.xml"
+        listings = []
+        for _repetition in range(2):
+            export(target, f"copy_names_{mode}")
+            folder = shared or target.parent / "scene_assets"
+            listings.append(sorted(p.name for p in folder.iterdir() if not p.name.startswith(".")))
+        assert listings[0] == listings[1], ("a repeated export changed the folder", listings)
+        root = xml(target)
+        files = {(element.tag, element.get("name")): target.parent / element.get("file")
+                 for element in root.find("asset") if element.get("file")}
+        # The unused texture is gone; the height field that shared its file still has it.
+        assert ("texture", "bumps") not in files and set(files) == set(sources), sorted(files)
+        for key, name in sources.items():
+            assert files[key].read_bytes() == (source_dir / name).read_bytes(), (mode, key, files[key])
+        assert files["hfield", "terrain"] != files["texture", "terrain"], files
+        assert files["texture", "a b"] != files["texture", "a_b"], files
+        names = sorted({path.name for path in files.values()})
+        assert listings[-1] == names, (listings[-1], names)
+        results[mode] = {f"{tag}:{name}": path.name for (tag, name), path in files.items()}
+    # Chula-style names stay: files without a clash keep the element's name.
+    assert results["per_xml"]["hfield:terrain"] == "terrain.png" and results["per_xml"]["texture:a b"] == "a_b.png", results
+    assert results["per_xml"]["texture:terrain"].startswith("texture_"), results
+    return results
 
 
 @section

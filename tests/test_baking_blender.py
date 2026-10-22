@@ -25,6 +25,7 @@ import harness  # noqa: E402
 OUT, _ = harness.begin("bake")
 from mujoco_world.baking import BakeError, bake_static, restore_sources  # noqa: E402
 from mujoco_world.exporter import export_world  # noqa: E402
+from mujoco_world.project import adopt_mjcf  # noqa: E402
 
 bpy.ops.object.select_all(action="SELECT")
 bpy.ops.object.delete(use_global=False)
@@ -208,6 +209,52 @@ summary ={"passed": True, "sources": first["source_count"], "excluded_dynamic": 
            "hdr_max": max(pixels), "red_texels": red_texels, "blue_texels": blue_texels,
            "dynamic_reposition_max_difference": max_difference, "master_exr": first["master_exr"],
            "display_png": first["display_png"], "scene_xml": str(output / "scene.xml"), "restored_sources": restored}
+
+# Adopted project: a fixed object added after adopting is hidden once baked,
+# yet the adopted export keeps its collider, and the atlas replaces its visual.
+ADOPTED_WORLD = """<mujoco model="adopted_bake">
+  <compiler angle="radian"/>
+  <worldbody>
+    <geom name="floor" type="plane" size="5 5 0.1"/>
+    <geom name="Table" type="box" size="0.4 0.3 0.02" pos="0 0 0.7"/>
+  </worldbody>
+</mujoco>
+"""
+bpy.ops.wm.read_homefile(use_empty=True)
+adopted_scene = bpy.context.scene
+adopted_scene.unit_settings.scale_length = 1.0
+adopted_scene.render.engine = "CYCLES"
+adopted_world = bpy.data.worlds.new("Adopted bake world")
+adopted_scene.world = adopted_world
+if adopted_world.node_tree is None:
+    adopted_world.use_nodes = True  # Blender 4.x; Blender 5 worlds always have a tree.
+adopted_world.node_tree.nodes["Background"].inputs["Strength"].default_value = 3
+adopted_dir = output / "adopted"
+adopted_dir.mkdir()
+(adopted_dir / "source.xml").write_text(ADOPTED_WORLD)
+bpy.ops.mesh.primitive_plane_add(size=10)
+bpy.context.object.name = "floor"
+bpy.ops.mesh.primitive_cube_add(size=2, location=(0, 0, 0.7))
+table = bpy.context.object
+table.name, table.scale = "Table", (0.4, 0.3, 0.02)
+bpy.context.view_layer.update()
+adopt_mjcf(bpy.context, str(adopted_dir / "source.xml"))
+bpy.ops.mesh.primitive_cube_add(size=2, location=(1.5, 0, 0.4))
+chair = bpy.context.object
+chair.name, chair.scale = "Chair", (0.2, 0.2, 0.4)
+chair.data.materials.append(material("chair", (0.6, 0.3, 0.1)))
+bpy.context.view_layer.update()
+adopted_bake = bake_static(bpy.context, str(adopted_dir / "bake"), atlas_size=64, samples=2, margin=1)
+assert chair.get("mjworld_bake_source") and chair.hide_render, "the new chair was not baked"
+adopted_report = export_world(bpy.context, str(adopted_dir / "scene.xml"))
+adopted_root = ET.parse(adopted_dir / "scene.xml").getroot()
+chair_geoms = [geom.attrib for geom in adopted_root.iter("geom") if geom.get("name", "").startswith("Chair")]
+assert [geom.get("name") for geom in chair_geoms] == ["Chair_000_collision"], f"chair geoms: {chair_geoms}"
+assert ([chair_geoms[0].get(key) for key in ("type", "contype", "conaffinity", "group")]
+        == ["box", "1", "1", "3"]), chair_geoms[0]
+assert not [w for w in adopted_report["warnings"] if "marked as a bake source" in w], adopted_report["warnings"]
+summary["adopted_bake"] = {"sources": adopted_bake["source_count"], "chair_collision": chair_geoms[0],
+                           "scene_xml": str(adopted_dir / "scene.xml")}
 (output / "bake_test_report.json").write_text(json.dumps(summary, indent=2))
 harness.complete(output, "bake")
 print("STATIC_BAKE_TEST_OK", json.dumps(summary))

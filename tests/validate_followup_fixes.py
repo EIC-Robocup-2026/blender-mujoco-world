@@ -88,4 +88,19 @@ for name in ("outside_allowed", "outside_shared_library"):
     assert models[name].ntex == 1, (name, models[name].ntex)
 results["outside_assets"] = {name: int(models[name].ntex) for name in ("outside_allowed", "outside_shared_library")}
 
+# Doors oriented by euler and xyaxes, with a new starting angle: MuJoCo reads
+# the single quaternion, the source orientation turned by the angle change.
+doors = models["door_orientations"]
+for name, wanted in summary["door_orientations"].items():
+    quat = doors.body(name).quat
+    assert np.isclose(abs(np.dot(quat, wanted)), 1, atol=1e-6), (name, quat, wanted)
+results["door_orientations"] = sorted(summary["door_orientations"])
+
+# The material layer's texture loads; both height fields and the three used textures load.
+assert models["layered"].ntex == 1 and models["layered"].nmat == 1, (models["layered"].ntex, models["layered"].nmat)
+for mode in ("per_xml", "shared"):
+    model = models[f"copy_names_{mode}"]
+    assert (model.ntex, model.nhfield) == (3, 2), (mode, model.ntex, model.nhfield)
+results["copy_names"] = {"textures": 3, "hfields": 2}
+
 print("FOLLOWUP_FIXES_PHYSICS_OK", json.dumps(results))
