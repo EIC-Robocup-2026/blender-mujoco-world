@@ -427,6 +427,11 @@ def bake_static(context, output_directory, *, atlas_size=2048, samples=128, marg
         # or faceless) are restored, so they are not hidden without an atlas.
         stale = [obj for obj in scene.objects if is_bake_source(obj) and obj not in baked]
         _remove_objects(previous_atlases)
+        # The base names are free only now that the previous bake is gone.
+        # Taking them again keeps a rebake from alternating with '.001' names.
+        atlas.name = atlas.data.name = collection.name = "MuJoCo baked static visual"
+        master.name = master_path.name
+        emission_material.name = "MuJoCo baked static lighting"
         succeeded = True
         return {"object": atlas.name, "source_count": len(baked), "atlas_size": atlas_size,
                 "samples": samples, "master_exr": str(master_path), "display_png": str(display_path),
