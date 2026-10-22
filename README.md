@@ -27,6 +27,10 @@ A Blender addon for authoring, baking, and exporting portable MuJoCo environment
 
 Visible mesh objects export by default. Choose **Leave out** to exclude an object, or enable **Export selected objects only**. **Leave out** on a body group Empty also excludes every part inside it. Collision helpers belonging to a bake or adopted world remain exportable while hidden. Blender lights illuminate the static bake; they are not directly converted into MuJoCo lights in a newly authored world.
 
+Hide such helpers, adopted objects and body group Empties with the eye icon (**Hide in Viewport**). Blender does not update the placement or modifiers of an object that is disabled in viewports (monitor icon) or sits in a collection excluded from the view layer, so the export stops with an error that names those objects instead of writing stale geometry.
+
+A failed export leaves the previous `scene.xml`, `export_report.json` and assets unchanged: files are written next to their targets first and replace them only after the whole world was built. In a shared asset folder, new files it had already added stay behind, but no existing file changes.
+
 For a joined room mesh with one baked atlas, choose **Visual only** in its Object type dropdown. Build separate simple boxes for the walls, furniture tops and legs, choose **Collision helper** in each box's dropdown, and keep those helpers visible in Blender: they switch to wire display and export only invisible fixed collision, so they do not cover the baked appearance. Hiding a helper excludes it entirely.
 
 ## An openable door in four steps
@@ -114,6 +118,23 @@ primitive dimensions, supported colours/images, mass, and hinge settings can be
 edited. New props and grouped collision helpers can be added. Unchanged imported
 physics remains exact. Complex procedural material edits need a new static bake.
 
+Adoption checks the whole XML before it changes anything, so a missing object or
+a malformed attribute leaves the previous adoption untouched, and **Adopt** can
+be undone with Ctrl + Z. Regenerated meshes keep the source mesh's `inertia`,
+`maxhullvert` and `smoothnormal`; a visual mesh without its own inertia mode gets
+`inertia="shell"`.
+
+When an adopted body is changed to **Movable object** or **Door**, or adopted
+parts are grouped into a new body, its **Weight** is split evenly over the body's
+colliding geoms. A body that kept its role and weight, or that has an explicit
+`<inertial>`, keeps its source masses.
+
+Copies of adopted objects (**Shift + D**) export under their own Blender names;
+their joints, sites and other named children are renamed after the copy. The
+object that still has the adopted name keeps the original MJCF names. If several
+objects claim one adopted name and none of them has it as its Blender name, the
+export stops and asks you to rename the original.
+
 ### Image export
 
 Simple flat colours and directly connected UV Image Textures are supported for
@@ -156,10 +177,18 @@ When merging into the current Walkie model, use its existing collision-mask sche
 | --- | --- |
 | Plane contact type | `1` |
 | Plane contact mask | `32` |
-| Fixed/door contact type | `64` |
-| Fixed/door contact mask | `56` |
+| Fixed contact type | `64` |
+| Fixed contact mask | `56` |
+| Door contact type | `32` |
+| Door contact mask | `121` |
 | Movable contact type | `32` |
 | Movable contact mask | `121` |
+
+`robot_bringup.world_loader` gives every geom that moves with a joint (doors,
+movable objects and the parts grouped inside them) the movable masks, so the
+preset does the same and an exported world behaves like the merged one. Empty
+**Door contact type/mask** fields use the fixed values; projects that applied
+the preset before these fields existed need to click it again.
 
 Do not add a second plane named `floor` when merging with a robot scene that already supplies it. Walkie's ROS launch uses the installed `robot_bringup.world_loader` library to combine the exported room with the robot and preserve its four explicit wheel/floor pairs. An isolated exported world defaults to masks `1/1` so ordinary free objects collide normally.
 
@@ -167,7 +196,7 @@ Do not add a second plane named `floor` when merging with a robot scene that alr
 
 This is an environment exporter, not a general Blender physics, URDF or robot exporter. It does not translate Blender rigid-body constraints, animations, Geometry Nodes instances, collection instances, procedural shader graphs, or transparency pipelines. Cycles lighting and procedural colour can be baked into the static atlas. Convert curves/text to mesh and realize instances before export. Hollow movable containers need grouped compound helpers; a single convex collider still fills their cavities.
 
-The included `example.blend` is a small test scene. Additional tests exercise grouped compound bodies, retained imported physics, editable doors/props, and static baking with collision and HDR preservation. `tests/build_smoke_scene.py` generates a fresh export in Blender; `tests/validate_export.py` compiles it in MuJoCo and checks geometry, floor contact policy, preserved weight, texture buffers, selection-only export, portability and the door's torque-driven movement. Results are saved in `tests/output/validation_report.json`; the generated scene is saved as `tests/output/example.blend`, so the tracked `example.blend` is not rewritten. `tests/test_export_fixes_blender.py OUTPUT` and `tests/validate_export_fixes.py OUTPUT [WALKIE_ROS_ROOT]` cover radian angles, inertia settings that merge cleanly with a robot, contact mask formats, body name clashes, excluded body groups, and adopted `fromto` primitives.
+The included `example.blend` is a small test scene. Additional tests exercise grouped compound bodies, retained imported physics, editable doors/props, and static baking with collision and HDR preservation. `tests/build_smoke_scene.py` generates a fresh export in Blender; `tests/validate_export.py` compiles it in MuJoCo and checks geometry, floor contact policy, preserved weight, texture buffers, selection-only export, portability and the door's torque-driven movement. Results are saved in `tests/output/validation_report.json`; the generated scene is saved as `tests/output/example.blend`, so the tracked `example.blend` is not rewritten. `tests/test_export_fixes_blender.py OUTPUT` and `tests/validate_export_fixes.py OUTPUT [WALKIE_ROS_ROOT]` cover radian angles, inertia settings that merge cleanly with a robot, contact mask formats, body name clashes, excluded body groups, and adopted `fromto` primitives. `tests/test_adopt_blender.py OUTPUT` and `tests/validate_adopt.py OUTPUT` build a small adopted world and cover all-or-nothing adoption, carried mesh inertia, duplicated adopted objects, in-place export, viewport-disabled objects, Weight on adopted bodies, the hinge cursor on shared meshes, failed exports, shared asset folders, and door contact masks. `tests/test_shared_assets_blender.py ROOM OUTPUT` exports both Chula variants into one shared folder; pass a writable copy of the room, because it adopts and exports inside it.
 
 The OBJ/MJCF export uses documented [MuJoCo mesh](https://mujoco.readthedocs.io/en/stable/XMLreference.html#asset-mesh) and [hinge joint](https://mujoco.readthedocs.io/en/stable/XMLreference.html#body-joint) conventions. No external service or asset library is required.
 
@@ -178,6 +207,12 @@ worlds should reuse one asset library. Leave it empty for the usual directory
 beside each XML. Relative folders are resolved from the saved Blender project.
 The Chula low-poly project uses `//scene_assets`; its baked project uses
 `//../scene_assets`. Keep the shared library with both XMLs when sharing.
+
+An export never changes a file in the shared folder. A file keeps its usual name
+when that name is free or already holds the same bytes; otherwise it is written
+as `mesh_<hash>` or `texture_<hash>` after its content, so a world that already
+references the old file still loads it unchanged. Files no world uses any more
+are not deleted automatically.
 
 To build the installation ZIP from this source project:
 
