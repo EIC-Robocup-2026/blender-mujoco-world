@@ -137,7 +137,9 @@ image_settings.color_depth = "8"
 hdr.save_render(str(out / "hdr_agx_reference.png"), scene=bpy.context.scene)
 image_settings.file_format, image_settings.color_mode, image_settings.color_depth = previous
 (out / "expected_vertices.json").write_text(json.dumps(expected))
-bpy.ops.wm.save_as_mainfile(filepath=str(ROOT / "example.blend"))
+# Save the generated scene with the other test outputs; the tracked
+# example.blend is never rewritten by a test run.
+bpy.ops.wm.save_as_mainfile(filepath=str(out / "example.blend"))
 # Exercise the selection-only path too.
 bpy.ops.object.select_all(action="DESELECT")
 prop.select_set(True)
