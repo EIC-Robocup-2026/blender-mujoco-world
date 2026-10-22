@@ -42,7 +42,7 @@ Objects linked from another `.blend` file are skipped by the role buttons, **Gro
 
 Hide such helpers, adopted objects and body group Empties with the eye icon (**Hide in Viewport**). Blender does not update the placement or modifiers of an object that is disabled in viewports (monitor icon) or sits in a collection excluded from the view layer, so the export stops with an error that names those objects instead of writing stale geometry.
 
-A failed export leaves the previous `scene.xml`, `export_report.json` and assets unchanged: files are written next to their targets first and replace them only after the whole world was built. In a shared asset folder, new files it had already added stay behind, but no existing file changes.
+A failed export leaves the previous `scene.xml`, `export_report.json` and assets unchanged: files are written next to their targets first and replace them only after the whole world was built. The new asset files move in first, then the XML and report, and only then are the previous export's unused files removed, so even when replacing the XML itself fails, every file the old XML names still exists. In a shared asset folder, new files it had already added stay behind, but no existing file changes.
 
 For a joined room mesh with one baked atlas, choose **Visual only** in its Object type dropdown. Build separate simple boxes for the walls, furniture tops and legs, choose **Collision helper** in each box's dropdown, and keep those helpers visible in Blender: they switch to wire display and export only invisible fixed collision, so they do not cover the baked appearance. Hiding a helper excludes it entirely.
 
@@ -54,7 +54,7 @@ Exporting `<name>.xml` writes these files:
 | --- | --- | --- |
 | `<name>.xml` | every export | The MuJoCo world. Asset paths are relative to it. |
 | `<name>_assets/` beside the XML, or the **Shared asset folder** | every export | OBJ meshes and PNG textures the world references. See [Share assets between variants](#share-assets-between-variants). |
-| `<name>_assets/.mujoco_world_manifest.json` | exports into the per-XML asset folder | The files this world wrote and their SHA-256 digests, so the next export can remove the unchanged ones it no longer writes. A shared folder gets no manifest. |
+| `<name>_assets/.mujoco_world_manifest.json` | exports into the per-XML asset folder | The files this world wrote and their SHA-256 digests. The next export replaces only these files and removes the unchanged ones it no longer writes. A shared folder gets no manifest. |
 | `export_report.json` beside the XML | every export | Add-on and Blender versions, object and triangle counts, the floor plane, the texture mode, per-object details and every note or warning. |
 | `OPEN_WORLD.txt` beside the XML | exports of new (not adopted) worlds | How to open the world in MuJoCo's viewer and what it does not contain. |
 
@@ -134,17 +134,33 @@ colliders. Meshes without faces are skipped and listed in the bake report.
 > reflections and transmission out of the atlas. Glass still lets light into
 > the room during the bake.
 
+Metal is found in Principled BSDFs (any Metallic value or link), in Metallic
+BSDF nodes, which bake as a Diffuse BSDF of their base colour, and inside node
+groups. A node group with metal inside is copied for the bake and the copy is
+deleted afterwards, so your groups never change. A Glossy BSDF is not
+converted: it contributes no diffuse colour, so a surface made only of one
+bakes dark. Use a Principled BSDF with Metallic for metal you want in the
+atlas.
+
 Bake clones keep the object-level inputs of their sources: object colour, ray
 visibility, holdout and shadow catcher, pass index, light and shadow linking,
 and custom properties read by **Attribute (Object)** nodes. **Object Info →
-Random** cannot be reproduced and produces a note.
+Random** cannot be reproduced and produces a note. For light and shadow
+linking, each clone joins the receiver and blocker collections that hold its
+source, with the source's include or exclude state, and leaves them again right
+after the bake, also when the bake fails. A linking collection linked from a
+library cannot be edited, so its sources get a note and their clones are lit as
+if they were not linked.
 
 **Edit original surfaces** asks for confirmation, then brings the original
 surfaces back and deletes the atlas and its packed lightmap; the EXR and PNG in
 the bake folder stay on disk. Bake again after changing them. A rebake also
 restores any part that it no longer bakes, for example one changed to
-**Movable object**. If the atlas object is deleted by hand, the export writes
-the hidden sources' own visuals again and adds a note.
+**Movable object**. The atlas references its sources as objects, so renaming
+a source after baking is fine. If the atlas object is deleted by hand, or a
+source is copied after baking (**Shift + D** copies the bake mark, but the
+atlas does not contain the copy), the export writes those hidden sources' own
+visuals again and adds a note.
 
 The output includes a packed half-float linear **EXR master** and an **AgX PNG**.
 The PNG always uses AgX with look None, exposure 0 and gamma 1 on the sRGB
@@ -258,6 +274,13 @@ object that still has the adopted name keeps the original MJCF names. If several
 objects claim one adopted name and none of them has it as its Blender name, the
 export stops and asks you to rename the original.
 
+New objects in an adopted world export as new bodies, or as new geoms of the
+adopted body they are parented to, with the names a new world gives them
+(`Lamp_000`, `Lamp_000_free`, `Lamp_000_collision` and so on). When one of
+these names is already a body, geom, joint or site name in the adopted XML,
+the export stops and names the objects to rename, because MuJoCo rejects a
+repeated name.
+
 ### Image export
 
 Simple flat colours and UV Image Textures are supported for Principled Base
@@ -266,8 +289,8 @@ unconnected, and a muted shader or image node falls back to the flat colour
 with a note. Packed and unsaved images export as PNG. An image without its own
 UV Map node uses the mesh's render-active UV map, the one Blender renders with.
 
-- **Baked float images** use the bake's recorded AgX display profile, keeping the HDR master unclipped. A float image on an object marked **Image already contains lighting** that has no recorded profile follows the scene's view transform, look, exposure and gamma; the note in `export_report.json` names the profile used.
-- **Ordinary display PNGs** retain their pixel values. An unmodified 16-bit PNG is copied unchanged (MuJoCo reads it as 8-bit).
+- **Baked float images** use the bake's recorded AgX display profile, keeping the HDR master unclipped. A float image on an object marked **Image already contains lighting**, or in an Emission shader, that has no recorded profile follows the scene's view transform, look, exposure and gamma; the note in `export_report.json` names the profile used. Such an HDR image is an EXR, HDR or unsaved float buffer.
+- **Ordinary display PNGs** retain their pixel values. An unmodified 16-bit PNG in the sRGB colour space is copied unchanged (MuJoCo reads it as 8-bit), also when it is a lightmap in an Emission shader or on an object marked **Image already contains lighting**: its values are display values already, so it gets no view transform and no HDR note.
 - **Other float albedo** (an EXR or an unsaved float buffer) is written as an 8-bit sRGB PNG with a note; values above 1 are clipped and noted.
 - **Non-Color or linear byte images** are re-encoded to sRGB in **Match PNG appearance** mode and tagged `colorspace="linear"` in **sRGB decode (custom renderer)** mode, so they keep Blender's brightness. Both modes add a note, because colour textures should use the sRGB colour space.
 - **UDIM (tiled) and missing images** fall back to the flat material colour with a note that names the object, material and image.
@@ -346,9 +369,20 @@ as the mesh of a renamed or deleted object. A listed file is removed only when
 it is still a regular file with the recorded content. A file you edited since,
 a file the manifest does not list, and a symbolic link (and whatever it points
 to) are left alone, so stale files from an export made before the manifest
-recorded digests stay until you delete them. No export writes through a
-symbolic link: a per-XML export replaces a link at a name it writes with its own
-file, and in a shared folder a link counts as a taken name.
+recorded digests stay until you delete them.
+
+A per-XML export replaces only the files its manifest lists and creates absent
+ones. Any other file already in the folder is not this world's: another world
+may use the folder as its shared asset folder, an older add-on version wrote
+it, or it is an adopted world's own source file. The export references such a
+file as it is when it holds the same bytes, and otherwise writes the new
+content beside it as `mesh_<hash>` or `texture_<hash>`. If that name is taken
+by other content too, the export stops with an error instead of replacing it.
+Within one export, two files of the same name with different content (a
+texture and a height field both called `terrain`, say) are kept apart the same
+way. No export writes through a symbolic link: a per-XML export replaces a
+listed link with its own file and treats any other link as taken, and in a
+shared folder a link counts as a taken name.
 
 ## Development
 
