@@ -1,13 +1,22 @@
 # MuJoCo World — Easy Export
 
-A Blender addon for authoring, baking, and exporting portable MuJoCo environments. It has no Python package dependencies inside Blender. Tested with **Blender 5.2.1 LTS**, **Blender 4.5.14 LTS** and **MuJoCo 3.15.0**; it declares Blender 4.2 as its minimum.
+A Blender add-on for authoring, baking, and exporting portable MuJoCo environments. It has no Python package dependencies inside Blender. Tested with **Blender 4.5.14 LTS** and **Blender 5.2.1 LTS** and **MuJoCo 3.15.0**. It declares Blender 4.2 as its minimum; Blender 4.2 to 4.4 are not tested.
 
 ## Install once
 
-1. Open **Edit → Preferences → Add-ons** in Blender.
-2. Open the menu at the top right and choose **Install from Disk…**.
-3. Choose [`mujoco_world.zip`](mujoco_world.zip), then enable **MuJoCo World — Easy Export**.
-4. In the 3D View, press **N** and open the **MuJoCo** tab.
+1. Build the installation ZIP from this repository (the ZIP is not committed):
+
+   ```bash
+   python3 package_addon.py
+   ```
+
+   This writes `dist/mujoco_world-<version>.zip`, for example `dist/mujoco_world-0.2.0.zip`.
+2. Open **Edit → Preferences → Add-ons** in Blender.
+3. Open the menu at the top right and choose **Install from Disk…**.
+4. Choose the ZIP. If **MuJoCo World — Easy Export** is not enabled afterwards, tick it in the add-on list.
+5. In the 3D View, press **N** and open the **MuJoCo** tab.
+
+To update, build a new ZIP and install it the same way; Blender replaces the previous copy. The add-on is a legacy add-on (`bl_info`), which Blender 4.2 and later still install from a ZIP.
 
 ## Make a world
 
@@ -22,20 +31,43 @@ A Blender addon for authoring, baking, and exporting portable MuJoCo environment
    | **Visual floor** | Visible, with **no collision**. |
 
 3. Leave **Add a real MuJoCo floor plane** enabled. This creates a single analytic plane named `floor`, separately from your decorative floor mesh. Its height is in metres.
-4. Click **Export world…** and save `scene.xml` in a new folder.
-5. Keep the XML and its `scene_assets/` directory together. The exporter writes a small `export_report.json` with any notes.
+4. Click **Export world…** (or **File → Export → MuJoCo World (.xml)**) and save `scene.xml` in a new folder.
+5. Keep the XML and its `scene_assets/` directory together. The exporter writes a small `export_report.json` with any notes; [What an export writes](#what-an-export-writes) lists every file.
 
 Visible mesh objects export by default. Choose **Leave out** to exclude an object, or enable **Export selected objects only**. **Leave out** on a body group Empty also excludes every part inside it. A fixed or visual mesh without faces (guide edges or points) is left out with a note in `export_report.json`. Curves, surfaces, text and metaballs are left out until converted to mesh, and instances are not realized: collection, vertex, face and particle instancing, and Geometry Nodes instances on a mesh (only the host's own mesh exports). Each such visible object gets a note, in ordinary and adopted worlds alike. Collision helpers belonging to a bake or adopted world remain exportable while hidden. Blender lights illuminate the static bake; they are not directly converted into MuJoCo lights in a newly authored world.
 
 Folders that start with `//` (the bake folder, a shared asset folder, the export path) are relative to the `.blend` file, so save the file first; until then the add-on refuses them instead of writing next to wherever Blender was started.
 
-Objects linked from another `.blend` file are skipped by the role buttons, **Group selected parts** and **Set hinge at 3D cursor**, because Blender discards edits to linked data on reload. Make a library override first; the MuJoCo object settings are editable on overrides.
+Objects linked from another `.blend` file are skipped by the role buttons, **Group selected parts as one body** and **Set hinge at 3D cursor**, because Blender discards edits to linked data on reload. Make a library override first; the MuJoCo object settings are editable on overrides.
 
 Hide such helpers, adopted objects and body group Empties with the eye icon (**Hide in Viewport**). Blender does not update the placement or modifiers of an object that is disabled in viewports (monitor icon) or sits in a collection excluded from the view layer, so the export stops with an error that names those objects instead of writing stale geometry.
 
 A failed export leaves the previous `scene.xml`, `export_report.json` and assets unchanged: files are written next to their targets first and replace them only after the whole world was built. In a shared asset folder, new files it had already added stay behind, but no existing file changes.
 
 For a joined room mesh with one baked atlas, choose **Visual only** in its Object type dropdown. Build separate simple boxes for the walls, furniture tops and legs, choose **Collision helper** in each box's dropdown, and keep those helpers visible in Blender: they switch to wire display and export only invisible fixed collision, so they do not cover the baked appearance. Hiding a helper excludes it entirely.
+
+## What an export writes
+
+Exporting `<name>.xml` writes these files:
+
+| File | Written by | Contents |
+| --- | --- | --- |
+| `<name>.xml` | every export | The MuJoCo world. Asset paths are relative to it. |
+| `<name>_assets/` beside the XML, or the **Shared asset folder** | every export | OBJ meshes and PNG textures the world references. See [Share assets between variants](#share-assets-between-variants). |
+| `<name>_assets/.mujoco_world_manifest.json` | exports into the per-XML asset folder | The files this world wrote, so the next export can remove the ones it no longer writes. A shared folder gets no manifest. |
+| `export_report.json` beside the XML | every export | Add-on and Blender versions, object and triangle counts, the floor plane, the texture mode, per-object details and every note or warning. |
+| `OPEN_WORLD.txt` beside the XML | exports of new (not adopted) worlds | How to open the world in MuJoCo's viewer and what it does not contain. |
+
+`export_report.json` and `OPEN_WORLD.txt` have fixed names, so give each exported world its own folder; a second XML in the same folder replaces the first world's report.
+
+**Bake static lighting** writes into its **Bake folder** (default `//baked_lighting`, beside the `.blend` file):
+
+| File | Contents |
+| --- | --- |
+| `static_lighting_linear.exr` | Half-float linear HDR master of the lighting atlas. It is also packed into the `.blend` file. |
+| `static_lightmap.png` | The atlas as an AgX display PNG; the export writes the atlas texture from the same profile. |
+
+The export browser of a saved `.blend` file starts at `//mujoco_export/scene.xml`, and afterwards at the last export.
 
 ## An openable door in four steps
 
@@ -123,17 +155,15 @@ their atlas brightness. The visible static atlas uses an Emission material and
 has no contact. Moving objects continue to use runtime lighting. Export the
 world after baking; saving the Blender file alone does not update MJCF.
 
-The current Chula project already contains its white lights and procedural
-materials. Rebaking uses those authored lights and finishes; the add-on contains
-no room-specific layout or colour recipe.
+A rebake uses the lights and materials authored in the project; the add-on
+contains no room-specific layout or colour recipe.
 
 ### Keep authored worlds editable
 
 A saved Blender project is the authoring source. Exported XML and its asset
-folder are the simulation deliverable. Walkie's room sources and exported assets
-live in `walkie-ros/simulation/gazebo/worlds/` and are installed with the
-`robot_simulation` package. This add-on stays in its separate repository;
-`walkie-ros` supplies robot integration and ROS launches.
+folder are the simulation deliverable; keep both under version control next to
+the project that uses them. Robot integration and launch files belong to the
+robot's own repository, not to this add-on.
 
 For an existing Blender scene accompanied by a matching expanded world XML,
 **World advanced settings → Link existing world physics…** associates same-named
@@ -157,14 +187,14 @@ as in MuJoCo. Asset files are found the way MuJoCo finds them, following the
 source compiler's `assetdir`, `meshdir`, `texturedir` and `strippath`, including
 cube and skybox textures (`fileright` … `fileback`), height fields and skins.
 
-The migrated Chula Blender projects are already adopted. Existing body placement,
-primitive dimensions, supported colours/images, mass, and hinge settings can be
-edited. New props and grouped collision helpers can be added. Unchanged imported
-physics remains exact. Complex procedural material edits need a new static bake.
+Once a project is adopted, existing body placement, primitive dimensions,
+supported colours/images, mass, and hinge settings can be edited. New props and
+grouped collision helpers can be added. Unchanged imported physics remains
+exact. Complex procedural material edits need a new static bake.
 
 Adoption checks the whole XML before it changes anything, so a missing object or
-a malformed attribute leaves the previous adoption untouched, and **Adopt** can
-be undone with Ctrl + Z. Regenerated meshes keep the source mesh's `inertia`,
+a malformed attribute leaves the previous adoption untouched, and **Link
+existing world physics…** can be undone with Ctrl + Z. Regenerated meshes keep the source mesh's `inertia`,
 `maxhullvert` and `smoothnormal`; a visual mesh without its own inertia mode gets
 `inertia="shell"`. Regenerated meshes are named after their Blender object. When
 two names become the same in MJCF characters, or a name has none of them (Thai
@@ -219,7 +249,7 @@ UV Map node uses the mesh's render-active UV map, the one Blender renders with.
 - **Baked float images** use the bake's recorded AgX display profile, keeping the HDR master unclipped. A float image on an object marked **Image already contains lighting** that has no recorded profile follows the scene's view transform, look, exposure and gamma; the note in `export_report.json` names the profile used.
 - **Ordinary display PNGs** retain their pixel values. An unmodified 16-bit PNG is copied unchanged (MuJoCo reads it as 8-bit).
 - **Other float albedo** (an EXR or an unsaved float buffer) is written as an 8-bit sRGB PNG with a note; values above 1 are clipped and noted.
-- **Non-Color or linear byte images** are re-encoded to sRGB in **Match PNG appearance** mode and tagged `colorspace="linear"` in **sRGB decode** mode, so they keep Blender's brightness. Both modes add a note, because colour textures should use the sRGB colour space.
+- **Non-Color or linear byte images** are re-encoded to sRGB in **Match PNG appearance** mode and tagged `colorspace="linear"` in **sRGB decode (custom renderer)** mode, so they keep Blender's brightness. Both modes add a note, because colour textures should use the sRGB colour space.
 - **UDIM (tiled) and missing images** fall back to the flat material colour with a note that names the object, material and image.
 
 ### Why texture colour is explicit
@@ -246,46 +276,31 @@ In a Python environment with MuJoCo 3.15+ installed:
 python -m mujoco.viewer --mjcf=/absolute/path/to/scene.xml
 ```
 
-On this Linux machine, the native viewer needs the X11 workaround:
+On a Wayland desktop, the native viewer may need to run under X11:
 
 ```bash
 env -u WAYLAND_DISPLAY XDG_SESSION_TYPE=x11 \
-  /home/tawan/walkie-ros/.pixi/envs/default/bin/python -m mujoco.viewer \
-  --mjcf=/absolute/path/to/scene.xml
+  python -m mujoco.viewer --mjcf=/absolute/path/to/scene.xml
 ```
 
 This command opens the environment. Robot models, ROS controllers and drive controls must be added separately.
 
-## Walkie and omni wheels
+## Use with a robot
 
-The exported `floor` is an actual **MuJoCo plane**, even if a detailed visual floor lies at the same height. No triangle floor mesh participates in collision. In a robot model, preserve the robot's wheel-capsule/plane contact pairs and anisotropic friction; this exporter does not guess robot-specific wheel contacts.
+The exported `floor` is an actual **MuJoCo plane**, even if a detailed visual floor lies at the same height. No triangle floor mesh participates in collision. When you merge the world into a robot model:
 
-When merging into the current Walkie model, use its existing collision-mask scheme. Click **World advanced settings → Use Walkie contact masks**, or enter the Chula-world values:
+- Keep the single plane named `floor`, and do not add a second one if the robot scene already supplies it.
+- Preserve the robot's wheel/plane contact pairs and anisotropic friction; this exporter does not guess robot-specific wheel contacts.
+- A new world writes angles in radians (`<compiler angle="radian">`), the convention of robot models generated from URDF; an adopted world keeps its source's angle unit.
+- Set the contact type and mask of the plane, fixed, door and movable geoms under **World advanced settings** to match the robot's collision classes. Empty **Door contact type/mask** fields use the fixed values.
 
-| Setting | Value |
-| --- | --- |
-| Plane contact type | `1` |
-| Plane contact mask | `32` |
-| Fixed contact type | `64` |
-| Fixed contact mask | `56` |
-| Door contact type | `32` |
-| Door contact mask | `121` |
-| Movable contact type | `32` |
-| Movable contact mask | `121` |
+An isolated exported world defaults to masks `1/1`, so ordinary free objects collide normally.
 
-`robot_bringup.world_loader` gives every geom that moves with a joint (doors,
-movable objects and the parts grouped inside them) the movable masks, so the
-preset does the same and an exported world behaves like the merged one. Empty
-**Door contact type/mask** fields use the fixed values; projects that applied
-the preset before these fields existed need to click it again.
+For the Walkie robot, **World advanced settings → Use Walkie contact masks** sets its collision classes. Walkie's ROS launch reassigns the same classes when it merges a world with the robot, so an exported world behaves the same on its own and merged; see Walkie's [collision classes](https://eic-robocup-2026.github.io/walkie-ros/guides/simulation-mujoco/#collision-classes). Projects that applied the preset before the door fields existed need to click it again.
 
-Do not add a second plane named `floor` when merging with a robot scene that already supplies it. Walkie's ROS launch uses the installed `robot_bringup.world_loader` library to combine the exported room with the robot and preserve its four explicit wheel/floor pairs. An isolated exported world defaults to masks `1/1` so ordinary free objects collide normally.
-
-## Scope and verification
+## Scope
 
 This is an environment exporter, not a general Blender physics, URDF or robot exporter. It does not translate Blender rigid-body constraints, animations, Geometry Nodes instances, collection instances, procedural shader graphs, or transparency pipelines. Cycles lighting and procedural colour can be baked into the static atlas. Convert curves/text to mesh and realize instances before export. Hollow movable containers need grouped compound helpers; a single convex collider still fills their cavities.
-
-The included `example.blend` is a small test scene. Additional tests exercise grouped compound bodies, retained imported physics, editable doors/props, and static baking with collision and HDR preservation. `tests/build_smoke_scene.py` generates a fresh export in Blender; `tests/validate_export.py` compiles it in MuJoCo and checks geometry, floor contact policy, preserved weight, texture buffers, selection-only export, portability and the door's torque-driven movement. Results are saved in `tests/output/validation_report.json`; the generated scene is saved as `tests/output/example.blend`, so the tracked `example.blend` is not rewritten. `tests/test_export_fixes_blender.py OUTPUT` and `tests/validate_export_fixes.py OUTPUT [WALKIE_ROS_ROOT]` cover radian angles, inertia settings that merge cleanly with a robot, contact mask formats, body name clashes, excluded body groups, and adopted `fromto` primitives. `tests/test_adopt_blender.py OUTPUT` and `tests/validate_adopt.py OUTPUT` build a small adopted world and cover all-or-nothing adoption, carried mesh inertia, duplicated adopted objects, in-place export, viewport-disabled objects, Weight on adopted bodies, the hinge cursor on shared meshes, failed exports, shared asset folders, and door contact masks. `tests/test_shared_assets_blender.py ROOM OUTPUT` exports both Chula variants into one shared folder; pass a writable copy of the room, because it adopts and exports inside it. `tests/test_review_fixes_blender.py OUTPUT` and `tests/validate_review_fixes.py OUTPUT` cover metal and emission in the bake, the pinned lightmap profile under Override and video output, stale bake marks, bake failure cleanup, faceless meshes, clone shading inputs, the bake's early checks, render-active UV maps, 16-bit/float/UDIM/missing/Non-Color images, reroutes and muted nodes, adopted texture colour spaces, and the operators' linked-data, restore and error handling. `tests/test_followup_fixes_blender.py OUTPUT` and `tests/validate_followup_fixes.py OUTPUT` cover stretched capsules, rejected `<frame>` and `<replicate>`, slide, ball and untyped joints, class-typed geoms, contact classes on moved geoms, body and geom maps, colliding and non-ASCII mesh names, origin offsets, notes for curves and instances, volume-weighted mass, a moved blend file, stale-file cleanup, asset directories with cube textures and height fields, rebake names and repeated add-on registration.
 
 The OBJ/MJCF export uses documented [MuJoCo mesh](https://mujoco.readthedocs.io/en/stable/XMLreference.html#asset-mesh) and [hinge joint](https://mujoco.readthedocs.io/en/stable/XMLreference.html#body-joint) conventions. No external service or asset library is required.
 
@@ -294,8 +309,9 @@ The OBJ/MJCF export uses documented [MuJoCo mesh](https://mujoco.readthedocs.io/
 Set **World advanced settings → Shared asset folder** when several exported
 worlds should reuse one asset library. Leave it empty for the usual directory
 beside each XML. Relative folders are resolved from the saved Blender project.
-The Chula low-poly project uses `//scene_assets`; its baked project uses
-`//../scene_assets`. Keep the shared library with both XMLs when sharing.
+For example, `room.blend` can use `//scene_assets` and `baked/room_baked.blend`
+`//../scene_assets`, so both export into the same folder. Keep the shared
+library with both XMLs when sharing.
 
 An export never changes a file in the shared folder. A file keeps its usual name
 when that name is free or already holds the same bytes; otherwise it is written
@@ -309,8 +325,15 @@ removes listed files it no longer writes, such as the mesh of a renamed or
 deleted object. Files the manifest does not list are left alone, so stale files
 from an export made before the manifest existed stay until you delete them.
 
-To build the installation ZIP from this source project:
+## Development
+
+The tests run real exports in Blender and compile the results with MuJoCo.
+`tests/run_all.sh` runs all of them into a fresh temporary folder outside the
+checkout and exits non-zero on any failure:
 
 ```bash
-python3 package_addon.py
+BLENDER=/path/to/blender PYTHON=/path/to/python3 tests/run_all.sh
 ```
+
+[tests/README.md](tests/README.md) lists the requirements, the optional inputs
+and what each test covers.
