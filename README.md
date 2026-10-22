@@ -25,7 +25,7 @@ A Blender addon for authoring, baking, and exporting portable MuJoCo environment
 4. Click **Export world…** and save `scene.xml` in a new folder.
 5. Keep the XML and its `scene_assets/` directory together. The exporter writes a small `export_report.json` with any notes.
 
-Visible mesh objects export by default. Choose **Leave out** to exclude an object, or enable **Export selected objects only**. **Leave out** on a body group Empty also excludes every part inside it. A fixed or visual mesh without faces (guide edges or points) is left out with a note in `export_report.json`. Collision helpers belonging to a bake or adopted world remain exportable while hidden. Blender lights illuminate the static bake; they are not directly converted into MuJoCo lights in a newly authored world.
+Visible mesh objects export by default. Choose **Leave out** to exclude an object, or enable **Export selected objects only**. **Leave out** on a body group Empty also excludes every part inside it. A fixed or visual mesh without faces (guide edges or points) is left out with a note in `export_report.json`. Curves, surfaces, text and metaballs are left out until converted to mesh, and instances are not realized: collection, vertex, face and particle instancing, and Geometry Nodes instances on a mesh (only the host's own mesh exports). Each such visible object gets a note, in ordinary and adopted worlds alike. Collision helpers belonging to a bake or adopted world remain exportable while hidden. Blender lights illuminate the static bake; they are not directly converted into MuJoCo lights in a newly authored world.
 
 Folders that start with `//` (the bake folder, a shared asset folder, the export path) are relative to the `.blend` file, so save the file first; until then the add-on refuses them instead of writing next to wherever Blender was started.
 
@@ -64,7 +64,9 @@ For a hollow cup, plate, or another object made of several pieces:
 3. Select the visual and all helpers, then click **Group selected parts as one body**.
 4. Select the resulting Empty and choose **Movable object**, its weight, or **Door** and its hinge settings.
 
-All child colliders belong to that one body and move together. Body groups can
+All child colliders belong to that one body and move together. Its **Weight** is
+split over the colliders in proportion to their volume (a mesh collider counts
+its convex hull), so the centre of mass sits where the material is. Body groups can
 contain fixed or hinged child groups. Free bodies stay at the top level. Use
 separate collision pieces around an opening instead of a convex hull that fills
 it. Parent transforms and hierarchy are preserved. Blender rigid-body
@@ -134,12 +136,26 @@ live in `walkie-ros/simulation/gazebo/worlds/` and are installed with the
 `walkie-ros` supplies robot integration and ROS launches.
 
 For an existing Blender scene accompanied by a matching expanded world XML,
-**World advanced settings → Adopt existing MJCF physics** associates same-named
+**World advanced settings → Link existing world physics…** associates same-named
 body Empties and geometry meshes with its exact masses, compound colliders,
 joints, contact parameters, and defaults. This adopts physics onto existing
 geometry; it is not a general MJCF geometry importer. Renamed objects can be
-mapped through the Python `adopt_mjcf(..., object_map=...)` API. Missing objects
-produce an error rather than dropping colliders.
+mapped through the Python `adopt_mjcf(..., object_map=..., body_map=...,
+geom_map=...)` API. `object_map` applies to bodies and geoms alike; `body_map`
+and `geom_map` apply to one kind and take precedence, so a body and a geom that
+share an MJCF name can go to different objects. Missing objects produce an error
+rather than dropping colliders, and so do two MJCF elements that match one
+object. Unnamed geoms cannot be matched, except a single unnamed world geom on a
+baked atlas.
+
+The XML must be standalone. `<include>`, `<frame>` and `<replicate>` are
+refused, because the export would write their contents twice; expand or flatten
+them first. Geom types and sizes may come from `<default>` classes. Slide and
+ball joints are kept exactly as in the source; the door settings (limits,
+damping, axis) apply to a body's hinge, and a joint without a `type` is a hinge,
+as in MuJoCo. Asset files are found the way MuJoCo finds them, following the
+source compiler's `assetdir`, `meshdir`, `texturedir` and `strippath`, including
+cube and skybox textures (`fileright` … `fileback`), height fields and skins.
 
 The migrated Chula Blender projects are already adopted. Existing body placement,
 primitive dimensions, supported colours/images, mass, and hinge settings can be
@@ -150,12 +166,41 @@ Adoption checks the whole XML before it changes anything, so a missing object or
 a malformed attribute leaves the previous adoption untouched, and **Adopt** can
 be undone with Ctrl + Z. Regenerated meshes keep the source mesh's `inertia`,
 `maxhullvert` and `smoothnormal`; a visual mesh without its own inertia mode gets
-`inertia="shell"`.
+`inertia="shell"`. Regenerated meshes are named after their Blender object. When
+two names become the same in MJCF characters, or a name has none of them (Thai
+names, for example), a short hash of the Blender name keeps the mesh names apart.
+
+Asset files are read beside the adopted XML. The adoption records that path
+relative to the `.blend` file and also as an absolute path, so a blend moved
+later still finds them; if neither exists, the export stops and names the folder
+it looked in. The absolute path is stored in the `.blend` file and shows the
+folder layout of the machine that adopted the world.
+
+Blender objects are often modelled with the origin at their base, while MuJoCo
+places a primitive at its centre. An adopted box, sphere, cylinder, capsule or
+ellipsoid whose object origin is elsewhere keeps that offset: the untouched geom
+stays where the source put it, and an edited one moves with its object. Only the
+position offset is kept; the geom's orientation follows the object. A stretched
+capsule keeps its round caps: the radius follows the narrow axes and the length
+the long one. A capsule scaled shorter than it is wide stops the export; use a
+sphere or a convex helper there.
+
+The export follows the Blender hierarchy. When an adopted geom's object sits
+under a different body than in the source XML, adoption and export both add a
+note naming the two bodies, and the geom or body keeps its source class through
+an explicit `class` or `childclass`, so its contact parameters do not change. A
+moving body that had colliders in the source but has none left gets a warning,
+because it would pass through everything. A door whose adopted body has only
+slide or ball joints keeps them, with a note that its door settings were not
+applied.
 
 When an adopted body is changed to **Movable object** or **Door**, or adopted
-parts are grouped into a new body, its **Weight** is split evenly over the body's
-colliding geoms. A body that kept its role and weight, or that has an explicit
-`<inertial>`, keeps its source masses.
+parts are grouped into a new body, its **Weight** is split over the body's
+colliding geoms in proportion to their volume (a mesh geom counts its convex
+hull; if one volume is unknown, the split is even). Each geom gets an explicit
+`mass`, so the total stays exact whatever density the source used. A body that
+kept its role and weight, or that has an explicit `<inertial>`, keeps its source
+masses.
 
 Copies of adopted objects (**Shift + D**) export under their own Blender names;
 their joints, sites and other named children are renamed after the copy. The
@@ -182,6 +227,16 @@ UV Map node uses the mesh's render-active UV map, the one Blender renders with.
 The default **Match PNG appearance** writes `colorspace="linear"` on MuJoCo textures. Here that means *do not decode already display-referred PNG byte values again* in the native viewer. This avoids a saved baked image becoming unexpectedly dark. The native viewer's output is not a complete Blender/AgX colour pipeline, so exact Blender and MuJoCo appearance is not guaranteed.
 
 For a custom renderer that decodes sRGB and applies its own final display transform, choose **sRGB decode (custom renderer)** instead. This decision is explicit rather than depending on a PNG's embedded metadata: Blender 5.2 writes an sRGB chunk into PNGs and 4.5 does not, which would flip MuJoCo's `auto` setting. Adopted exports therefore also write the mode's colour space on retained textures that had none. See MuJoCo's [texture colour-space reference](https://mujoco.readthedocs.io/en/stable/XMLreference.html#asset-texture-colorspace).
+
+Baked and runtime surfaces still differ in two ways. The atlas PNG uses the AgX
+curve, while flat colours and ordinary textures on movable props use the plain
+sRGB curve, so props can look more saturated or contrasted than the baked room
+around them. And MuJoCo's headlight (ambient 0.3, diffuse 0.4 in a new world)
+still lights the baked atlas on top of its **Baked texture brightness** emission
+(default 0.2), so the baked shading is multiplied again by light that changes
+with the viewing angle, and **Match PNG appearance** cannot hold exactly for
+baked surfaces. A higher **Baked texture brightness** lets the baked shading
+dominate, at the cost of a brighter room.
 
 ## Open the exported scene
 
@@ -230,7 +285,7 @@ Do not add a second plane named `floor` when merging with a robot scene that alr
 
 This is an environment exporter, not a general Blender physics, URDF or robot exporter. It does not translate Blender rigid-body constraints, animations, Geometry Nodes instances, collection instances, procedural shader graphs, or transparency pipelines. Cycles lighting and procedural colour can be baked into the static atlas. Convert curves/text to mesh and realize instances before export. Hollow movable containers need grouped compound helpers; a single convex collider still fills their cavities.
 
-The included `example.blend` is a small test scene. Additional tests exercise grouped compound bodies, retained imported physics, editable doors/props, and static baking with collision and HDR preservation. `tests/build_smoke_scene.py` generates a fresh export in Blender; `tests/validate_export.py` compiles it in MuJoCo and checks geometry, floor contact policy, preserved weight, texture buffers, selection-only export, portability and the door's torque-driven movement. Results are saved in `tests/output/validation_report.json`; the generated scene is saved as `tests/output/example.blend`, so the tracked `example.blend` is not rewritten. `tests/test_export_fixes_blender.py OUTPUT` and `tests/validate_export_fixes.py OUTPUT [WALKIE_ROS_ROOT]` cover radian angles, inertia settings that merge cleanly with a robot, contact mask formats, body name clashes, excluded body groups, and adopted `fromto` primitives. `tests/test_adopt_blender.py OUTPUT` and `tests/validate_adopt.py OUTPUT` build a small adopted world and cover all-or-nothing adoption, carried mesh inertia, duplicated adopted objects, in-place export, viewport-disabled objects, Weight on adopted bodies, the hinge cursor on shared meshes, failed exports, shared asset folders, and door contact masks. `tests/test_shared_assets_blender.py ROOM OUTPUT` exports both Chula variants into one shared folder; pass a writable copy of the room, because it adopts and exports inside it. `tests/test_review_fixes_blender.py OUTPUT` and `tests/validate_review_fixes.py OUTPUT` cover metal and emission in the bake, the pinned lightmap profile under Override and video output, stale bake marks, bake failure cleanup, faceless meshes, clone shading inputs, the bake's early checks, render-active UV maps, 16-bit/float/UDIM/missing/Non-Color images, reroutes and muted nodes, adopted texture colour spaces, and the operators' linked-data, restore and error handling.
+The included `example.blend` is a small test scene. Additional tests exercise grouped compound bodies, retained imported physics, editable doors/props, and static baking with collision and HDR preservation. `tests/build_smoke_scene.py` generates a fresh export in Blender; `tests/validate_export.py` compiles it in MuJoCo and checks geometry, floor contact policy, preserved weight, texture buffers, selection-only export, portability and the door's torque-driven movement. Results are saved in `tests/output/validation_report.json`; the generated scene is saved as `tests/output/example.blend`, so the tracked `example.blend` is not rewritten. `tests/test_export_fixes_blender.py OUTPUT` and `tests/validate_export_fixes.py OUTPUT [WALKIE_ROS_ROOT]` cover radian angles, inertia settings that merge cleanly with a robot, contact mask formats, body name clashes, excluded body groups, and adopted `fromto` primitives. `tests/test_adopt_blender.py OUTPUT` and `tests/validate_adopt.py OUTPUT` build a small adopted world and cover all-or-nothing adoption, carried mesh inertia, duplicated adopted objects, in-place export, viewport-disabled objects, Weight on adopted bodies, the hinge cursor on shared meshes, failed exports, shared asset folders, and door contact masks. `tests/test_shared_assets_blender.py ROOM OUTPUT` exports both Chula variants into one shared folder; pass a writable copy of the room, because it adopts and exports inside it. `tests/test_review_fixes_blender.py OUTPUT` and `tests/validate_review_fixes.py OUTPUT` cover metal and emission in the bake, the pinned lightmap profile under Override and video output, stale bake marks, bake failure cleanup, faceless meshes, clone shading inputs, the bake's early checks, render-active UV maps, 16-bit/float/UDIM/missing/Non-Color images, reroutes and muted nodes, adopted texture colour spaces, and the operators' linked-data, restore and error handling. `tests/test_followup_fixes_blender.py OUTPUT` and `tests/validate_followup_fixes.py OUTPUT` cover stretched capsules, rejected `<frame>` and `<replicate>`, slide, ball and untyped joints, class-typed geoms, contact classes on moved geoms, body and geom maps, colliding and non-ASCII mesh names, origin offsets, notes for curves and instances, volume-weighted mass, a moved blend file, stale-file cleanup, asset directories with cube textures and height fields, rebake names and repeated add-on registration.
 
 The OBJ/MJCF export uses documented [MuJoCo mesh](https://mujoco.readthedocs.io/en/stable/XMLreference.html#asset-mesh) and [hinge joint](https://mujoco.readthedocs.io/en/stable/XMLreference.html#body-joint) conventions. No external service or asset library is required.
 
@@ -247,6 +302,12 @@ when that name is free or already holds the same bytes; otherwise it is written
 as `mesh_<hash>` or `texture_<hash>` after its content, so a world that already
 references the old file still loads it unchanged. Files no world uses any more
 are not deleted automatically.
+
+The usual per-XML asset folder belongs to one world. The export lists the files
+it wrote in `.mujoco_world_manifest.json` inside that folder, and the next export
+removes listed files it no longer writes, such as the mesh of a renamed or
+deleted object. Files the manifest does not list are left alone, so stale files
+from an export made before the manifest existed stay until you delete them.
 
 To build the installation ZIP from this source project:
 
