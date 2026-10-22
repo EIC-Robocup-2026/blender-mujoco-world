@@ -43,7 +43,7 @@ def update_authored_materials(scene, root, assets_path, asset_prefix=None):
     gets a new material reference on that object rather than changing every
     object that used the imported material.
     """
-    from .exporter import _write_image, numbers, slug, srgb
+    from .exporter import _write_image, numbers, property_numbers, slug, srgb
     asset_prefix = assets_path.name if asset_prefix is None else asset_prefix
     asset = root.find("asset")
     if asset is None:
@@ -76,7 +76,7 @@ def update_authored_materials(scene, root, assets_path, asset_prefix=None):
                 rgba[:3] = [srgb(value) for value in rgba[:3]]
             baked = bool(snapshot["baked"] or info["emission"])
             attributes = {"name": label, "rgba": numbers(rgba), "specular": "0",
-                          "emission": str(scene.mujoco_world.baked_emission if baked else 0)}
+                          "emission": property_numbers([scene.mujoco_world.baked_emission if baked else 0])}
             if image:
                 filename = label + ".png"
                 _write_image(image, assets_path / filename, baked=baked, scene=scene)

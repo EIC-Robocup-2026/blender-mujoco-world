@@ -56,10 +56,127 @@ def _pose(matrix):
     return {"pos": numbers(matrix.translation), "quat": numbers(matrix.to_quaternion().normalized())}
 
 
-def _matrix(attrs):
+_AXES = {"x": (1, 0, 0), "y": (0, 1, 0), "z": (0, 0, 1)}
+# Primitive types that accept fromto; their length then comes from the segment.
+_ELONGATED = {"capsule", "cylinder", "box", "ellipsoid"}
+
+
+def _floats(attrs, field, count=None):
+    from .exporter import ExportError
+    try:
+        values = [float(v) for v in attrs[field].split()]
+    except ValueError as exc:
+        raise ExportError(f"{attrs.get('name', '<unnamed>')}: {field} must contain numbers.") from exc
+    if count is not None and len(values) != count:
+        raise ExportError(f"{attrs.get('name', '<unnamed>')}: {field} needs {count} numbers.")
+    return values
+
+
+def _z_to_quaternion(direction):
+    """MuJoCo's minimal rotation taking +Z onto ``direction`` (zaxis and fromto)."""
+    direction = direction.normalized()
+    axis = Vector((0, 0, 1)).cross(direction)
+    sine = axis.length
+    axis = Vector((1, 0, 0)) if sine < 1e-10 else axis / sine
+    return Quaternion(axis, math.atan2(sine, direction.z))
+
+
+def _orientation(attrs, compiler=None):
+    """Frame rotation of an MJCF element, honouring compiler angle and eulerseq."""
+    degree = compiler is None or compiler.get("angle", "degree") == "degree"
+    def angle(value):
+        return math.radians(value) if degree else value
+    if "quat" in attrs or not any(field in attrs for field in ("axisangle", "xyaxes", "zaxis", "euler")):
+        return Quaternion(tuple(float(v) for v in attrs.get("quat", "1 0 0 0").split()))
+    if "axisangle" in attrs:
+        x, y, z, value = _floats(attrs, "axisangle", 4)
+        return Quaternion(Vector((x, y, z)).normalized(), angle(value))
+    if "xyaxes" in attrs:
+        values = _floats(attrs, "xyaxes", 6)
+        x_axis = Vector(values[:3]).normalized()
+        y_axis = Vector(values[3:])
+        y_axis = (y_axis - x_axis * x_axis.dot(y_axis)).normalized()
+        return Matrix((x_axis, y_axis, x_axis.cross(y_axis))).transposed().to_quaternion()
+    if "zaxis" in attrs:
+        return _z_to_quaternion(Vector(_floats(attrs, "zaxis", 3)))
+    sequence = compiler.get("eulerseq", "xyz") if compiler is not None else "xyz"
+    rotation = Quaternion()
+    for axis, value in zip(sequence, _floats(attrs, "euler", 3)):
+        step = Quaternion(Vector(_AXES[axis.lower()]), angle(value))
+        # Lower case rotates about the moving frame, upper case about the parent.
+        rotation = rotation @ step if axis.islower() else step @ rotation
+    return rotation
+
+
+def _matrix(attrs, compiler=None):
+    if attrs.get("fromto"):
+        points = _floats(attrs, "fromto", 6)
+        start, end = Vector(points[:3]), Vector(points[3:])
+        # MuJoCo aligns the geom's +Z with from - to, centred on the segment.
+        return Matrix.LocRotScale((start + end) / 2, _z_to_quaternion(start - end), Vector((1, 1, 1)))
     pos = Vector(tuple(float(v) for v in attrs.get("pos", "0 0 0").split()))
-    quat = Quaternion(tuple(float(v) for v in attrs.get("quat", "1 0 0 0").split()))
-    return Matrix.LocRotScale(pos, quat, Vector((1, 1, 1)))
+    return Matrix.LocRotScale(pos, _orientation(attrs, compiler), Vector((1, 1, 1)))
+
+
+def _full_size(attrs):
+    """Explicit primitive size, with the length a fromto segment implies."""
+    from .exporter import ExportError
+    kind = attrs.get("type", "sphere")
+    size = _floats(attrs, "size") if attrs.get("size") else []
+    if attrs.get("fromto") and kind in _ELONGATED and size:
+        points = _floats(attrs, "fromto", 6)
+        # Double precision: mathutils vectors are float32 and would write 0.340000007.
+        half = math.dist(points[:3], points[3:]) / 2
+        size = [size[0], half] if kind in {"capsule", "cylinder"} else [size[0], size[0], half]
+    needed = {"sphere": 1, "capsule": 2, "cylinder": 2, "box": 3, "ellipsoid": 3}.get(kind)
+    if needed is None:
+        return size
+    if len(size) < needed:
+        raise ExportError(f"{attrs.get('name', '<unnamed>')}: a {kind} needs {needed} explicit size values to be moved or scaled; "
+                          "write them on the geom in the source MJCF.")
+    return size[:needed]
+
+
+def _same_segment(transform, attrs, tolerance=2e-6):
+    """Whether a pose still describes an unchanged fromto primitive.
+
+    The shape is symmetric about its segment, so a Blender object built with +Z
+    from 'from' to 'to', or rolled about its axis, is the same geom.
+    """
+    frame = _matrix(attrs)
+    def close(a, b):
+        return max(abs(x - y) for x, y in zip(a, b)) <= tolerance
+    if not close(transform.translation, frame.translation):
+        return False
+    z_axis, frame_z = transform.col[2].to_3d(), frame.col[2].to_3d()
+    if not (close(z_axis, frame_z) or close(z_axis, -frame_z)):
+        return False
+    if attrs.get("type", "sphere") in {"capsule", "cylinder"}:
+        return True
+    # Box and ellipsoid fromto shapes have equal X and Y sizes.
+    x_axis = transform.col[0].to_3d()
+    return any(close(x_axis, axis) or close(x_axis, -axis) for axis in (frame.col[0].to_3d(), frame.col[1].to_3d()))
+
+
+def _check_segment_axis(obj, kind, size, unit):
+    """Refuse to rewrite a fromto primitive whose Blender object is not modelled along local Z.
+
+    A rewritten fromto geom takes the object's own frame, and MuJoCo lays a
+    primitive's length along that frame's Z axis. An object modelled along
+    local X or Y would turn the shape by 90 degrees, so stop instead.
+    """
+    from .exporter import ExportError
+    values = [float(v) for v in size.split()]
+    radius, half = values[0], values[1] if kind in {"capsule", "cylinder"} else values[2]
+    length = 2 * (half + radius) if kind == "capsule" else 2 * half
+    scale = _scale(obj.matrix_world)
+    extents = [(max(v[i] for v in obj.bound_box) - min(v[i] for v in obj.bound_box)) * scale[i] * unit for i in range(3)]
+    if max(extents) - min(extents) <= 0.01 * max(extents):
+        return  # Nearly cubic: no modelling axis stands out.
+    if min(range(3), key=lambda i: abs(extents[i] - length)) != 2:
+        raise ExportError(f"{obj.name}: this fromto {kind} changed, but its Blender object is not modelled along local Z, "
+                          "so the new pose would turn the shape. Rotate the mesh so its length is along local Z, "
+                          "or edit the fromto in the source MJCF.")
 
 
 def _resolved_path(value):
@@ -119,7 +236,8 @@ def adopt_mjcf(context, filepath, *, object_map=None):
         if joint is not None:
             degree = compiler is None or compiler.get("angle", "degree") == "degree"
             conversion = 1.0 if degree else 180.0 / math.pi
-            limits = [float(v) * conversion for v in joint.get("range", "-110 0").split()]
+            # The fallback is the add-on's default door, already in degrees.
+            limits = [float(v) * conversion for v in joint.get("range").split()] if joint.get("range") else [-110.0, 0.0]
             obj.mujoco_world.hinge_min, obj.mujoco_world.hinge_max = limits
             obj.mujoco_world.hinge_start = float(joint.get("ref", "0")) * conversion
             obj.mujoco_world.damping = float(joint.get("damping", "0"))
@@ -148,8 +266,14 @@ def adopt_mjcf(context, filepath, *, object_map=None):
         # sphere meshes. Use their source dimensions as the baseline so manual
         # geometry/scale edits made before the first adoption are preserved too.
         kind = attrs.get("type", "sphere")
+        size = None
         if obj.get("mujoco_type") == kind and kind not in {"mesh", "plane"}:
-            size = [float(v) for v in attrs.get("size", "").split()]
+            try:
+                size = _full_size(attrs)
+            except ExportError:
+                # Size inherited from a <default> class: measure the object instead.
+                size = None
+        if size:
             half = [1, 1, 1]
             if kind in {"box", "ellipsoid"}:
                 scale = size[:3]
@@ -216,13 +340,47 @@ def group_selected(context, role="FREE"):
     return parent
 
 
+def validate_parts(scene, objects, labels):
+    """Reject grouped parts that would export incorrectly, before any file is written.
+
+    ``labels`` are the body names the ordinary exporter gives ``objects``.
+    """
+    from .exporter import ExportError, check_door
+    owners = set()
+    for obj in objects:
+        owner = body_owner(obj)
+        if owner is None:
+            continue
+        if obj.mujoco_world.role in {"FREE", "HINGE"}:
+            kind = "Movable" if obj.mujoco_world.role == "FREE" else "Door"
+            raise ExportError(f"{obj.name}: a {kind} part inside body group '{owner.name}' would lose its joint. "
+                              "Set the part to Fixed and give the group that role, or use a nested body Empty for a door inside a group.")
+        while owner is not None:
+            owners.add(owner)
+            owner = body_owner(owner)
+    # Body groups keep their Blender names; ungrouped parts get generated
+    # labels. Both share MuJoCo's body namespace, which also contains 'world'.
+    names = {owner.name: owner for owner in owners}
+    if "world" in names:
+        raise ExportError("A body group is named 'world', which MuJoCo reserves for the world body. Rename it.")
+    for obj, label in zip(objects, labels):
+        if body_owner(obj) is None and label in names:
+            raise ExportError(f"{obj.name}: its exported body name '{label}' is also the name of body group '{label}'. Rename one of them.")
+    adopted = bool(scene.get("mjworld_mjcf_template"))
+    for owner in sorted(owners, key=lambda o: o.name):
+        # Adopted joints keep their source limits; export_adopted checks edits.
+        if owner.mujoco_world.role == "HINGE" and not (adopted and owner.get("mjworld_mjcf_body")):
+            check_door(owner)
+
+
 def regroup_export(context, filepath, report):
     """Lift exported parts into compound bodies, retaining relative transforms."""
-    from .exporter import ExportError, numbers
-    path = _resolved_path(filepath).with_suffix(".xml")
+    from .exporter import ExportError, check_door, door_radians, mask_value, numbers, property_numbers, property_value, xml_path
+    path = xml_path(filepath)
     root = ET.parse(path).getroot()
     world = root.find("worldbody")
     unit = context.scene.unit_settings.scale_length
+    settings = context.scene.mujoco_world
     bodies = {}
     def make(obj):
         if obj in bodies:
@@ -239,14 +397,13 @@ def regroup_export(context, filepath, report):
                 raise ExportError(f"{obj.name}: a movable free body must be a top-level body.")
             ET.SubElement(body, "freejoint", name=obj.name + "_free")
         elif cfg.role == "HINGE":
-            if not cfg.hinge_min <= cfg.hinge_start <= cfg.hinge_max:
-                raise ExportError(f"{obj.name}: door starting angle must be inside its limits.")
+            check_door(obj)
             # The authored pose is the closed pose. Rotate the body at the
             # start, and set ref to that angle so limits stay in closed-space.
             axis = Vector({"X": (1, 0, 0), "Y": (0, 1, 0), "Z": (0, 0, 1)}[cfg.hinge_axis])
-            angle = math.radians(cfg.hinge_start)
-            body.set("quat", numbers(transform.to_quaternion() @ Quaternion(axis, angle)))
-            ET.SubElement(body, "joint", name=obj.name + "_hinge", type="hinge", axis=numbers(axis), range=numbers((cfg.hinge_min, cfg.hinge_max)), ref=str(cfg.hinge_start), damping=str(cfg.damping))
+            low, high, start = door_radians(cfg)
+            body.set("quat", numbers(transform.to_quaternion() @ Quaternion(axis, start)))
+            ET.SubElement(body, "joint", name=obj.name + "_hinge", type="hinge", axis=numbers(axis), range=numbers((low, high)), ref=numbers([start]), damping=property_numbers([cfg.damping]))
         bodies[obj] = body
         return body
     groups = {}
@@ -271,9 +428,9 @@ def regroup_export(context, filepath, report):
                 geom.attrib.update(_pose(pose))
                 if geom.get("contype") != "0":
                     movable = owner.mujoco_world.role == "FREE"
-                    geom.set("contype", getattr(context.scene.mujoco_world, "movable_contype" if movable else "object_contype"))
-                    geom.set("conaffinity", getattr(context.scene.mujoco_world, "movable_conaffinity" if movable else "object_conaffinity"))
-                    geom.set("mass", str(owner.mujoco_world.mass / len(colliders)) if owner.mujoco_world.role in {"FREE", "HINGE"} else "0")
+                    geom.set("contype", mask_value(settings, "movable_contype" if movable else "object_contype"))
+                    geom.set("conaffinity", mask_value(settings, "movable_conaffinity" if movable else "object_conaffinity"))
+                    geom.set("mass", numbers([property_value(owner.mujoco_world.mass) / len(colliders)]) if owner.mujoco_world.role in {"FREE", "HINGE"} else "0")
                 target.append(geom)
             world.remove(original)
             detail["body"] = owner.name
@@ -289,7 +446,7 @@ def regroup_export(context, filepath, report):
 
 def _append_new_parts(context, objects, root, world, asset, assets_path, make_body, warnings, asset_prefix=None):
     """Use the ordinary exporter for newly added furniture and compound props."""
-    from .exporter import _export_simple, ExportError, slug
+    from .exporter import _export_simple, ExportError, mask_value, numbers, property_numbers, property_value, slug
     if not objects:
         return []
     scene = context.scene
@@ -341,12 +498,14 @@ def _append_new_parts(context, objects, root, world, asset, assets_path, make_bo
                     raise ExportError(f"{owner.name}: a movable body needs at least one collision helper.")
                 for obj, detail in members:
                     body = parts_root.find(f"./worldbody/body[@name='{detail['body']}']")
-                    if root.find("compiler").get("angle", "degree") == "radian":
-                        for joint in body.findall("joint"):
-                            if joint.get("type", "hinge") in {"hinge", "ball"}:
-                                for field in ("range", "ref", "springref"):
-                                    if joint.get(field):
-                                        joint.set(field, " ".join(str(math.radians(float(v))) for v in joint.get(field).split()))
+                    # The part export is always in radians; follow the adopted
+                    # world. Degrees come from the properties, not the 9-digit
+                    # radian text, so -90 stays -90.
+                    if root.find("compiler").get("angle", "degree") == "degree":
+                        cfg = obj.mujoco_world
+                        for joint in body.findall("joint[@type='hinge']"):
+                            joint.set("range", property_numbers([cfg.hinge_min, cfg.hinge_max]))
+                            joint.set("ref", property_numbers([cfg.hinge_start]))
                     for geom in body.findall("geom"):
                         for field in ("mesh", "material"):
                             if geom.get(field) in rename:
@@ -357,10 +516,10 @@ def _append_new_parts(context, objects, root, world, asset, assets_path, make_bo
                             geom.attrib.update(_pose(relative @ _matrix(geom.attrib)))
                             if geom.get("contype") != "0":
                                 movable = owner.mujoco_world.role == "FREE"
-                                geom.set("contype", getattr(scene.mujoco_world, "movable_contype" if movable else "object_contype"))
-                                geom.set("conaffinity", getattr(scene.mujoco_world, "movable_conaffinity" if movable else "object_conaffinity"))
-                                mass = owner.mujoco_world.mass / collision_count if owner.mujoco_world.role in {"FREE", "HINGE"} and not owner.get("mjworld_mjcf_body") else 0
-                                geom.set("mass", str(mass))
+                                geom.set("contype", mask_value(scene.mujoco_world, "movable_contype" if movable else "object_contype"))
+                                geom.set("conaffinity", mask_value(scene.mujoco_world, "movable_conaffinity" if movable else "object_conaffinity"))
+                                movable_body = owner.mujoco_world.role in {"FREE", "HINGE"} and not owner.get("mjworld_mjcf_body")
+                                geom.set("mass", numbers([property_value(owner.mujoco_world.mass) / collision_count]) if movable_body else "0")
                             target.append(geom)
                     else:
                         target.append(body)
@@ -396,7 +555,7 @@ def _primitive_size(obj, attrs):
                 ratio[i] *= current / span
     if max(abs(ratio[i] - 1) for i in range(3)) < 2e-6:
         return attrs.get("size")
-    size = [float(x) for x in attrs.get("size", "").split()]
+    size = _full_size(attrs)
     if kind in {"box", "ellipsoid"}:
         size = [v * ratio[i] for i, v in enumerate(size)]
     elif kind in {"cylinder", "capsule"}:
@@ -412,14 +571,15 @@ def _primitive_size(obj, attrs):
 
 def export_adopted(context, filepath):
     """Export retained physics and live Blender geometry as a portable world."""
-    from .exporter import ExportError, _extract_geometry, _write_obj, _write_image, _asset_paths, numbers, inspect_material, slug
+    from .exporter import (ExportError, _extract_geometry, _write_obj, _write_image, _asset_paths, check_door, numbers,
+                           inspect_material, property_numbers, property_value, slug, xml_path)
     if context.mode != "OBJECT":
         raise ExportError("Switch to Object Mode before exporting.")
     scene = context.scene
     settings = scene.mujoco_world
     if settings.selected_only:
         raise ExportError("An adopted physics project exports the complete world. Turn off 'Export selected objects only' so joint, contact and keyframe references remain valid.")
-    path = _resolved_path(filepath).with_suffix(".xml")
+    path = xml_path(filepath)
     path.parent.mkdir(parents=True, exist_ok=True)
     assets_path, asset_prefix, shared_assets = _asset_paths(scene, path)
     root = ET.fromstring(scene["mjworld_mjcf_template"])
@@ -474,6 +634,9 @@ def export_adopted(context, filepath):
         raise ExportError("No mesh objects selected for export.")
     bodies = {}
     angle_factor = math.pi / 180 if compiler.get("angle", "degree") == "radian" else 1.0
+    def door_angles(cfg):
+        """Door limits and starting angle in the adopted world's angle unit."""
+        return [property_value(v) * angle_factor for v in (cfg.hinge_min, cfg.hinge_max, cfg.hinge_start)]
     def make_body(obj):
         if obj in bodies:
             return bodies[obj]
@@ -483,7 +646,7 @@ def export_adopted(context, filepath):
         transform = _rigid(obj.matrix_world, unit)
         if owner:
             transform = _rigid(owner.matrix_world, unit).inverted() @ transform
-        old = _matrix(attrs)
+        old = _matrix(attrs, compiler)
         # Avoid float32 Blender rounding changing untouched source poses.
         if max(abs(transform[i][j] - old[i][j]) for i in range(4) for j in range(4)) > 2e-6:
             for field in ("euler", "axisangle", "xyaxes", "zaxis"):
@@ -500,11 +663,11 @@ def export_adopted(context, filepath):
                     raise ExportError(f"{obj.name}: a free body must be top-level.")
                 ET.SubElement(body, "freejoint", name=obj.name + "_free")
             elif obj.mujoco_world.role == "HINGE":
-                if not cfg.hinge_min <= cfg.hinge_start <= cfg.hinge_max:
-                    raise ExportError(f"{obj.name}: starting angle must be within the door limits.")
+                check_door(obj)
                 axis = Vector({"X": (1, 0, 0), "Y": (0, 1, 0), "Z": (0, 0, 1)}[cfg.hinge_axis])
-                body.set("quat", numbers(transform.to_quaternion() @ Quaternion(axis, math.radians(cfg.hinge_start))))
-                ET.SubElement(body, "joint", name=obj.name + "_hinge", type="hinge", axis=numbers(axis), range=numbers((cfg.hinge_min * angle_factor, cfg.hinge_max * angle_factor)), ref=str(cfg.hinge_start * angle_factor), damping=str(cfg.damping))
+                low, high, start = door_angles(cfg)
+                body.set("quat", numbers(transform.to_quaternion() @ Quaternion(axis, math.radians(property_value(cfg.hinge_start)))))
+                ET.SubElement(body, "joint", name=obj.name + "_hinge", type="hinge", axis=numbers(axis), range=numbers((low, high)), ref=numbers([start]), damping=property_numbers([cfg.damping]))
         else:
             if cfg.role != baseline.get("role", cfg.role):
                 for node in list(body):
@@ -515,12 +678,16 @@ def export_adopted(context, filepath):
                         raise ExportError(f"{obj.name}: a free body must be top-level.")
                     ET.SubElement(body, "freejoint", name=obj.name + "_free")
                 elif cfg.role == "HINGE":
+                    # The body keeps its adopted pose at the starting angle, so
+                    # the closed pose need not be at 0.
+                    check_door(obj, closed_at_zero=False)
                     axis = {"X": (1, 0, 0), "Y": (0, 1, 0), "Z": (0, 0, 1)}[cfg.hinge_axis]
-                    ET.SubElement(body, "joint", name=obj.name + "_hinge", type="hinge", axis=numbers(axis), range=numbers((cfg.hinge_min * angle_factor, cfg.hinge_max * angle_factor)), ref=str(cfg.hinge_start * angle_factor), damping=str(cfg.damping))
+                    low, high, start = door_angles(cfg)
+                    ET.SubElement(body, "joint", name=obj.name + "_hinge", type="hinge", axis=numbers(axis), range=numbers((low, high)), ref=numbers([start]), damping=property_numbers([cfg.damping]))
             inertial = body.find("inertial")
             if inertial is not None and abs(cfg.mass - baseline.get("mass", cfg.mass)) > 1e-6:
-                ratio = cfg.mass / float(inertial.get("mass"))
-                inertial.set("mass", str(cfg.mass))
+                ratio = property_value(cfg.mass) / float(inertial.get("mass"))
+                inertial.set("mass", property_numbers([cfg.mass]))
                 for field in ("diaginertia", "fullinertia"):
                     if inertial.get(field):
                         inertial.set(field, numbers(float(v) * ratio for v in inertial.get(field).split()))
@@ -528,14 +695,18 @@ def export_adopted(context, filepath):
             if joint is not None and cfg.role == "HINGE":
                 if not cfg.hinge_min <= cfg.hinge_start <= cfg.hinge_max:
                     raise ExportError(f"{obj.name}: starting angle must be within the door limits.")
+                low, high, start = door_angles(cfg)
                 if cfg.hinge_min != baseline.get("hinge_min") or cfg.hinge_max != baseline.get("hinge_max"):
-                    joint.set("range", numbers((cfg.hinge_min * angle_factor, cfg.hinge_max * angle_factor)))
+                    # Source joints may legitimately exclude 0, so only order is required.
+                    if not low < high:
+                        raise ExportError(f"{obj.name}: the open limit must be below the closed limit.")
+                    joint.set("range", numbers((low, high)))
                 if cfg.damping != baseline.get("damping"):
-                    joint.set("damping", str(cfg.damping))
+                    joint.set("damping", property_numbers([cfg.damping]))
                 if cfg.hinge_axis != baseline.get("hinge_axis"):
                     joint.set("axis", numbers({"X": (1, 0, 0), "Y": (0, 1, 0), "Z": (0, 0, 1)}[cfg.hinge_axis]))
                 if abs(cfg.hinge_start - baseline.get("hinge_start", cfg.hinge_start)) > 1e-5:
-                    joint.set("ref", str(cfg.hinge_start * angle_factor))
+                    joint.set("ref", numbers([start]))
                     axis = Vector(tuple(float(v) for v in joint.get("axis", "0 0 1").split()))
                     delta = math.radians(cfg.hinge_start - baseline["hinge_start"])
                     body.set("quat", numbers(transform.to_quaternion() @ Quaternion(axis, delta)))
@@ -573,12 +744,24 @@ def export_adopted(context, filepath):
                     transform.translation += obj.matrix_world.to_3x3() @ (current_center - reference_center) * unit
             if owner:
                 transform = _rigid(owner.matrix_world, unit).inverted() @ transform
-            old = _matrix(attrs)
-            if max(abs(transform[i][j] - old[i][j]) for i in range(4) for j in range(4)) > 2e-6:
+            size = _primitive_size(obj, attrs)
+            segment = bool(attrs.get("fromto")) and kind in _ELONGATED
+            if segment:
+                # A fromto shape stays verbatim until it moves or is resized; then
+                # pos/quat and an explicit full size replace the segment.
+                resized = size != attrs.get("size")
+                moved = resized or not _same_segment(transform, attrs)
+                if moved and not resized:
+                    size = numbers(_full_size(attrs))
+                if moved:
+                    _check_segment_axis(obj, kind, size, unit)
+            else:
+                old = _matrix(attrs, compiler)
+                moved = max(abs(transform[i][j] - old[i][j]) for i in range(4) for j in range(4)) > 2e-6
+            if moved:
                 for field in ("fromto", "euler", "axisangle", "xyaxes", "zaxis"):
                     attrs.pop(field, None)
                 attrs.update(_pose(transform))
-            size = _primitive_size(obj, attrs)
             if size:
                 attrs["size"] = size
             if kind == "plane":
@@ -594,7 +777,8 @@ def export_adopted(context, filepath):
                 # noise; the written mesh retains full evaluated precision.
                 key = hashlib.sha256(json.dumps({"vertices": [[round(v, 5) for v in p] for p in geometry["vertices"]], "triangles": triangles, "uv": geometry["uv_layers"].get(uv_name)}, sort_keys=True).encode()).hexdigest()
                 if key not in mesh_cache:
-                    mesh_name = slug(attrs["name"]) + "_authored_mesh"
+                    # The atlas may be matched to an unnamed source geom.
+                    mesh_name = slug(attrs.get("name") or obj.name) + "_authored_mesh"
                     _write_obj(assets_path / (mesh_name + ".obj"), geometry, triangles, uv_name)
                     ET.SubElement(asset, "mesh", name=mesh_name, file=asset_prefix + "/" + mesh_name + ".obj", inertia="shell")
                     mesh_cache[key] = mesh_name
@@ -613,7 +797,7 @@ def export_adopted(context, filepath):
             info = inspect_material(mat)
             warnings.extend(info["warnings"])
             label = slug(obj.name) + "_" + str(index)
-            material_args = {"name": label + "_material", "rgba": numbers(info["color"]), "specular": "0", "emission": str(settings.baked_emission)}
+            material_args = {"name": label + "_material", "rgba": numbers(info["color"]), "specular": "0", "emission": property_numbers([settings.baked_emission])}
             image = info["image"]
             if image:
                 image_path = assets_path / (label + ".png")
