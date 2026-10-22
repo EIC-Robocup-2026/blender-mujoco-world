@@ -7,6 +7,7 @@ import os
 from array import array
 from pathlib import Path
 import re
+import shutil
 import struct
 import tempfile
 import xml.etree.ElementTree as ET
@@ -285,20 +286,127 @@ def _asset_paths(scene, filepath):
     return directory, prefix, bool(configured)
 
 
-def _asset_file(path, shared, writer):
-    """Shared exports must never overwrite another variant's mesh or texture."""
-    if not shared:
-        writer(path)
-        return path.name
-    with tempfile.TemporaryDirectory(prefix=".mjworld-", dir=path.parent) as temporary:
-        working = Path(temporary) / path.name
-        writer(working)
-        digest = hashlib.sha256(working.read_bytes()).hexdigest()[:24]
-        label = "texture" if path.suffix.lower() == ".png" else "mesh"
-        target = path.parent / (label + "_" + digest + path.suffix.lower())
-        if not target.exists():
-            working.replace(target)
-    return target.name
+def _content_name(path, data):
+    """Content-addressed file name for ``path`` in the same folder."""
+    label = "texture" if path.suffix.lower() == ".png" else "mesh"
+    return label + "_" + hashlib.sha256(data).hexdigest()[:24] + path.suffix.lower()
+
+
+class AssetWriter:
+    """Writes the mesh and texture files of one export.
+
+    A shared folder holds files that other exported worlds reference, so a
+    shared export never changes an existing file. Index-named files (the
+    ordinary exporter) always get content-addressed names. Name-based files
+    (adopted worlds) keep their name when that file is absent or byte-identical;
+    different content gets a content-addressed name instead.
+
+    A per-XML folder belongs to one world. Its files are staged and replace the
+    previous export's files only in commit(), so a failed export leaves the
+    previous output intact. Only files this export writes are ever removed,
+    never a protected source file.
+    """
+
+    def __init__(self, directory, shared):
+        self.directory = Path(directory)
+        self.shared = shared
+        self.written = set()
+        self._staged = {}
+        self._remove = set()
+        self._protected = set()
+        self._stage = None
+
+    def protect(self, path):
+        """Never remove ``path`` (an adopted world's own source asset)."""
+        self._protected.add(Path(path).resolve())
+
+    def _staging(self):
+        if self._stage is None:
+            self._stage = tempfile.TemporaryDirectory(prefix=".mjworld-stage-", dir=self.directory)
+        return Path(self._stage.name)
+
+    def _place(self, target, source, *, content_named, move):
+        """Put ``source`` into the shared folder without changing existing files."""
+        data = source.read_bytes()
+        if not content_named and (not target.exists() or target.read_bytes() == data):
+            final = target
+        else:
+            final = target.parent / _content_name(target, data)
+        if not final.exists():
+            if move:
+                source.replace(final)
+            else:
+                shutil.copyfile(source, final)
+        self.written.add(final.resolve())
+        return final.name
+
+    def write(self, filename, writer, *, content_named=False):
+        """Write one asset with ``writer(path)``; return the file name to reference."""
+        target = self.directory / filename
+        if not self.shared:
+            staged = self._staging() / filename
+            writer(staged)
+            self._staged[target.resolve()] = staged
+            self.written.add(target.resolve())
+            return filename
+        with tempfile.TemporaryDirectory(prefix=".mjworld-", dir=self.directory) as temporary:
+            working = Path(temporary) / filename
+            writer(working)
+            return self._place(target, working, content_named=content_named, move=True)
+
+    def copy(self, source, filename):
+        """Copy an existing asset file; return the file name to reference."""
+        target = self.directory / filename
+        if Path(source).resolve() == target.resolve():
+            return filename
+        if not self.shared:
+            return self.write(filename, lambda path: shutil.copyfile(source, path))
+        return self._place(target, Path(source), content_named=False, move=False)
+
+    def discard(self, path):
+        """Drop an asset that ended up unreferenced, if this export wrote it."""
+        path = Path(path).resolve()
+        if self.shared or path not in self.written or path in self._protected:
+            return
+        self._staged.pop(path, None)
+        self.written.discard(path)
+        self._remove.add(path)
+
+    def commit(self):
+        """Move staged files into place and remove discarded ones."""
+        for target, staged in self._staged.items():
+            os.replace(staged, target)
+        self._staged.clear()
+        for path in self._remove - self._protected:
+            path.unlink(missing_ok=True)
+        self._remove.clear()
+
+    def close(self):
+        if self._stage is not None:
+            self._stage.cleanup()
+            self._stage = None
+
+
+def _replace_file(path, write):
+    """Write ``path`` through a sibling temporary file, so a failure keeps the old file."""
+    path = Path(path)
+    temporary = path.with_name("." + path.name + ".mjworld-tmp")
+    try:
+        write(temporary)
+        if path.exists():
+            shutil.copymode(path, temporary)
+        os.replace(temporary, path)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
+def write_xml(root, path):
+    ET.indent(root, space="  ")
+    _replace_file(path, lambda target: ET.ElementTree(root).write(target, encoding="utf-8", xml_declaration=True))
+
+
+def write_text(path, text):
+    _replace_file(path, lambda target: target.write_text(text, encoding="utf-8"))
 
 
 def mask_value(settings, name):
@@ -306,14 +414,35 @@ def mask_value(settings, name):
     return _mask(getattr(settings, name), name.replace("_", " "))
 
 
-def _export_simple(context, filepath):
-    """Public entry point; works in UI and Blender background mode."""
-    from .project import _included, is_body, validate_parts
+def role_masks(settings, role):
+    """Contact type and mask for a collision geom of a body that moves as ``role``.
+
+    ``role`` is FREE or HINGE for geoms that move with such a body, else None.
+    A blank door mask follows the fixed mask, which doors used before they had
+    their own settings.
+    """
+    def pick(kind):
+        if role == "FREE":
+            return mask_value(settings, "movable_" + kind)
+        if role == "HINGE" and getattr(settings, "hinge_" + kind).strip():
+            return mask_value(settings, "hinge_" + kind)
+        return mask_value(settings, "object_" + kind)
+    return pick("contype"), pick("conaffinity")
+
+
+def _export_simple(context, filepath, *, regroup=False):
+    """Write an ordinary (not adopted) world; works in UI and Blender background mode.
+
+    With ``regroup``, body group Empties become compound bodies first. Files
+    are written only once the whole world is built, so a failed export keeps
+    the previous XML, report and per-XML assets.
+    """
+    from .project import _included, body_owner, check_evaluated, is_body, regroup_export, validate_parts
     scene = context.scene
     settings = scene.mujoco_world
     filepath = xml_path(filepath)
-    filepath.parent.mkdir(parents=True, exist_ok=True)
-    assets_path, asset_prefix, shared_assets = _asset_paths(scene, filepath)
+    if context.mode != "OBJECT":
+        raise ExportError("Switch to Object Mode before exporting.")
     unit = float(scene.unit_settings.scale_length)
     if unit <= 0:
         raise ExportError("Scene unit scale must be positive.")
@@ -328,16 +457,43 @@ def _export_simple(context, filepath):
                          and _included(o)), key=lambda o: o.name)
     if not objects:
         raise ExportError("No visible mesh objects to export. Select a mesh, or turn off 'Export selected objects only'.")
-    if context.mode != "OBJECT":
-        raise ExportError("Switch to Object Mode before exporting.")
-    mask = {name: mask_value(settings, name) for name in
-            ("plane_contype", "plane_conaffinity", "object_contype", "object_conaffinity", "movable_contype", "movable_conaffinity")}
+    plane_mask = (mask_value(settings, "plane_contype"), mask_value(settings, "plane_conaffinity"))
+    masks = {role: role_masks(settings, role) for role in (None, "FREE", "HINGE")}
     labels = [f"{slug(obj.name)}_{index:03d}" for index, obj in enumerate(objects)]
     # Validate before anything is written, so a rejected export leaves no XML.
     validate_parts(scene, objects, labels)
     for obj in objects:
         if obj.mujoco_world.role == "HINGE":
             check_door(obj)
+    owners = {owner for obj in objects for owner in [body_owner(obj)] if owner}
+    check_evaluated(context, objects + sorted(owners, key=lambda o: o.name))
+    filepath.parent.mkdir(parents=True, exist_ok=True)
+    assets_path, asset_prefix, shared_assets = _asset_paths(scene, filepath)
+    assets = AssetWriter(assets_path, shared_assets)
+    try:
+        root, report = _build_simple(context, filepath, objects, labels, candidates, unit, plane_mask, masks, assets, asset_prefix)
+        if regroup:
+            report = regroup_export(context, root, report)
+        assets.commit()
+        write_xml(root, filepath)
+        write_text(filepath.parent / "export_report.json", json.dumps(report, indent=2) + "\n")
+        write_text(filepath.parent / "OPEN_WORLD.txt",
+                   f"MuJoCo 3.15+\n\nOpen with:\n  python -m mujoco.viewer --mjcf={filepath.name}\n\n"
+                   f"Keep the XML and asset folder ({asset_prefix}) together. All asset paths are relative.\n"
+                   "In the viewer, double-click a movable object/door, then Ctrl+right-drag to apply force.\n"
+                   "Visual meshes do not collide. Collision shapes and the analytic floor are in group 3.\n"
+                   "For an omniwheel robot, preserve its explicit wheel-capsule/floor contact pairs when merging.\n"
+                   "This isolated world does not contain a robot or ROS controller configuration.\n")
+    finally:
+        assets.close()
+    return report
+
+
+def _build_simple(context, filepath, objects, labels, candidates, unit, plane_mask, masks, assets, asset_prefix):
+    """Build the ordinary world in memory; asset files go through ``assets``."""
+    from .project import _included
+    scene = context.scene
+    settings = scene.mujoco_world
     warnings = []
     for candidate in candidates:
         if candidate.visible_get(view_layer=context.view_layer) and not candidate.hide_render and _included(candidate):
@@ -361,8 +517,8 @@ def _export_simple(context, filepath):
     world = ET.SubElement(root, "worldbody")
     if settings.plane:
         ET.SubElement(world, "geom", name="floor", type="plane", pos=numbers([0, 0, property_value(settings.plane_height)]),
-                      size="0 0 0.05", rgba="0 0 0 0", group="3", contype=mask["plane_contype"],
-                      conaffinity=mask["plane_conaffinity"], friction="0.8 0.005 0.0001", mass="0")
+                      size="0 0 0.05", rgba="0 0 0 0", group="3", contype=plane_mask[0],
+                      conaffinity=plane_mask[1], friction="0.8 0.005 0.0001", mass="0")
     depsgraph = context.evaluated_depsgraph_get()
     report_objects = []
     exported_images = {}
@@ -414,8 +570,8 @@ def _export_simple(context, filepath):
                     image_key = (image.as_pointer(), baked)
                     if image_key not in exported_images:
                         image_name = f"texture_{len(exported_images):03d}"
-                        image_file = _asset_file(assets_path / (image_name + ".png"), shared_assets,
-                                                 lambda target: _write_image(image, target, baked=baked, scene=scene))
+                        image_file = assets.write(image_name + ".png", lambda target: _write_image(image, target, baked=baked, scene=scene),
+                                                  content_named=True)
                         if image.is_float:
                             warnings.append(f"{obj.name}: HDR bake '{image.name}' converted to display PNG using {scene.view_settings.view_transform}, exposure {scene.view_settings.exposure:g}. Keep that view transform consistent when comparing Blender and MuJoCo.")
                         ET.SubElement(asset, "texture", name=image_name, type="2d", file=image_file,
@@ -427,17 +583,17 @@ def _export_simple(context, filepath):
                 ET.SubElement(asset, "material", **material_args)
                 material_cache[key] = material_name
             mesh_name = f"{label}_visual_{material_id}"
-            mesh_file = _asset_file(assets_path / (mesh_name + ".obj"), shared_assets,
-                                    lambda target: _write_obj(target, geometry, triangles, uv_name if image else None))
+            mesh_file = assets.write(mesh_name + ".obj", lambda target: _write_obj(target, geometry, triangles, uv_name if image else None),
+                                     content_named=True)
             ET.SubElement(asset, "mesh", name=mesh_name, file=mesh_file, inertia="shell")
             ET.SubElement(body, "geom", name=mesh_name, type="mesh", mesh=mesh_name,
                           material=material_cache[key], contype="0", conaffinity="0", group="1", mass="0")
             total_triangles += len(triangles)
         collision_type = None
         if cfg.role != "VISUAL":
+            contype, conaffinity = masks[cfg.role if cfg.role in {"FREE", "HINGE"} else None]
             collision_args = {"name": label + "_collision", "pos": numbers(center), "group": "3", "rgba": "0 0 0 0",
-                              "contype": mask["movable_contype" if cfg.role == "FREE" else "object_contype"],
-                              "conaffinity": mask["movable_conaffinity" if cfg.role == "FREE" else "object_conaffinity"],
+                              "contype": contype, "conaffinity": conaffinity,
                               "friction": property_numbers(cfg.friction),
                               "mass": property_numbers([cfg.mass]) if cfg.role in {"FREE", "HINGE"} else "0"}
             flat_error = f"{obj.name}: collision mesh has zero thickness. Choose Visual floor / Visual only, or give it thickness."
@@ -458,8 +614,9 @@ def _export_simple(context, filepath):
                 collision_args.update(type="cylinder", size=numbers([radius, half.z]))
             else:
                 collision_name = label + "_hull"
-                collision_file = _asset_file(assets_path / (collision_name + ".obj"), shared_assets,
-                                             lambda target: _write_obj(target, geometry, [tri for _m, tri in geometry["triangles"]]))
+                collision_file = assets.write(collision_name + ".obj",
+                                              lambda target: _write_obj(target, geometry, [tri for _m, tri in geometry["triangles"]]),
+                                              content_named=True)
                 ET.SubElement(asset, "mesh", name=collision_name, file=collision_file, inertia="convex")
                 collision_args.update(type="mesh", mesh=collision_name, pos="0 0 0")
                 warnings.append(f"{obj.name}: convex collision fills cavities. For shelves, tables or doorways use separate box pieces.")
@@ -473,8 +630,6 @@ def _export_simple(context, filepath):
     midpoint = [0.5 * (min(v[i] for v in all_world_vertices) + max(v[i] for v in all_world_vertices)) for i in range(3)]
     extent = max(1.0, *(max(v[i] for v in all_world_vertices) - min(v[i] for v in all_world_vertices) for i in range(3)))
     ET.SubElement(root, "statistic", center=numbers(midpoint), extent=f"{extent:.9g}")
-    ET.indent(root, space="  ")
-    ET.ElementTree(root).write(filepath, encoding="utf-8", xml_declaration=True)
     warnings = list(dict.fromkeys(warnings))
     report = {"addon_version": "0.1.0", "blender_version": bpy.app.version_string, "file": filepath.name,
               "objects": len(objects), "meshes": sum(1 for x in asset if x.tag == "mesh"), "textures": len(exported_images),
@@ -483,25 +638,14 @@ def _export_simple(context, filepath):
                         "name": "floor", "only_visual_floor_meshes": all(x["role"] == "VISUAL" for x in report_objects if "floor" in x["source"].lower())},
               "texture_input": "linear/display values" if settings.texture_mode == "DISPLAY" else "sRGB decoded",
               "object_details": report_objects, "warnings": warnings}
-    (filepath.parent / "export_report.json").write_text(json.dumps(report, indent=2) + "\n", encoding="utf-8")
-    (filepath.parent / "OPEN_WORLD.txt").write_text(
-        f"MuJoCo 3.15+\n\nOpen with:\n  python -m mujoco.viewer --mjcf={filepath.name}\n\n"
-        f"Keep the XML and asset folder ({asset_prefix}) together. All asset paths are relative.\n"
-        "In the viewer, double-click a movable object/door, then Ctrl+right-drag to apply force.\n"
-        "Visual meshes do not collide. Collision shapes and the analytic floor are in group 3.\n"
-        "For an omniwheel robot, preserve its explicit wheel-capsule/floor contact pairs when merging.\n"
-        "This isolated world does not contain a robot or ROS controller configuration.\n", encoding="utf-8")
-    return report
+    return root, report
 
 
 def export_world(context, filepath):
     """Export an authored hierarchy, adopted MJCF project or ordinary mesh scene."""
-    from .project import export_adopted, regroup_export, is_body
+    from .project import export_adopted, is_body
     # Resolve once: every stage must read and write the same file name.
     filepath = xml_path(filepath)
     if context.scene.get("mjworld_mjcf_template"):
         return export_adopted(context, filepath)
-    report = _export_simple(context, filepath)
-    if any(is_body(obj) for obj in context.scene.objects):
-        report = regroup_export(context, filepath, report)
-    return report
+    return _export_simple(context, filepath, regroup=any(is_body(obj) for obj in context.scene.objects))

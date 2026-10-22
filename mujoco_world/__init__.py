@@ -70,8 +70,13 @@ class MJWORLD_SceneSettings(PropertyGroup):
     # Environment integration can require masks different from an isolated world.
     plane_contype: StringProperty(name="Plane contact type", default="1")
     plane_conaffinity: StringProperty(name="Plane contact mask", default="1")
-    object_contype: StringProperty(name="Fixed/door contact type", default="1")
-    object_conaffinity: StringProperty(name="Fixed/door contact mask", default="1")
+    object_contype: StringProperty(name="Fixed contact type", default="1")
+    object_conaffinity: StringProperty(name="Fixed contact mask", default="1")
+    # Blank door masks follow the fixed masks, as doors did before they had their own.
+    hinge_contype: StringProperty(name="Door contact type", default="",
+                                  description="Contact type of door collision geoms, and of everything that moves with a door. Empty uses the fixed contact type")
+    hinge_conaffinity: StringProperty(name="Door contact mask", default="",
+                                      description="Contact mask of door collision geoms, and of everything that moves with a door. Empty uses the fixed contact mask")
     movable_contype: StringProperty(name="Movable contact type", default="1")
     movable_conaffinity: StringProperty(name="Movable contact mask", default="1")
     texture_mode: EnumProperty(name="Texture colour", items=[
@@ -138,11 +143,31 @@ class MJWORLD_OT_hinge_cursor(Operator):
                 obj.matrix_world = matrix
             active.mujoco_world.body = True
         else:
-            bpy.ops.object.select_all(action="DESELECT")
-            active.select_set(True)
-            bpy.ops.object.origin_set(type="ORIGIN_CURSOR", center="MEDIAN")
-        for obj in selected:
-            obj.select_set(True)
+            # origin_set moves the mesh data, which would shift every other
+            # object that uses the same mesh.
+            mesh = active.data
+            users = mesh.users - int(mesh.use_fake_user)
+            if users > 1:
+                self.report({"ERROR"}, f"{active.name}: its mesh '{mesh.name}' is also used by {users - 1} other object(s), "
+                                       "which would move too. Run Object > Relation > Make Single User > Object & Data first, "
+                                       "or group the door parts under a body Empty and set the hinge on it.")
+                return {"CANCELLED"}
+            try:
+                bpy.ops.object.select_all(action="DESELECT")
+                active.select_set(True)
+                result = bpy.ops.object.origin_set(type="ORIGIN_CURSOR", center="MEDIAN")
+            except RuntimeError as exc:
+                result, error = {"CANCELLED"}, str(exc)
+            else:
+                error = "Blender could not move the origin."
+            finally:
+                bpy.ops.object.select_all(action="DESELECT")
+                for obj in selected:
+                    obj.select_set(True)
+                context.view_layer.objects.active = active
+            if "FINISHED" not in result:
+                self.report({"ERROR"}, f"{active.name}: {error}")
+                return {"CANCELLED"}
         active.mujoco_world.role = "HINGE"
         self.report({"INFO"}, "Hinge set. Local Z is the default vertical hinge direction.")
         return {"FINISHED"}
@@ -174,6 +199,7 @@ class MJWORLD_OT_adopt(Operator, ImportHelper):
     bl_idname = "mjworld.adopt_mjcf"
     bl_label = "Link existing world physics…"
     bl_description = "Attach exact body, joint and compound collider metadata from a standalone MJCF; match existing Blender object names"
+    bl_options = {"REGISTER", "UNDO"}
     filename_ext = ".xml"
     filter_glob: StringProperty(default="*.xml", options={"HIDDEN"})
 
@@ -231,6 +257,9 @@ class MJWORLD_OT_walkie_contacts(Operator):
         settings = context.scene.mujoco_world
         settings.plane_contype, settings.plane_conaffinity = "1", "32"
         settings.object_contype, settings.object_conaffinity = "64", "56"
+        # robot_bringup.world_loader treats every geom that moves with a joint,
+        # doors included, as a movable object.
+        settings.hinge_contype, settings.hinge_conaffinity = "32", "121"
         settings.movable_contype, settings.movable_conaffinity = "32", "121"
         self.report({"INFO"}, "Walkie masks set. Preserve the robot's explicit wheel/floor contact pairs when merging.")
         return {"FINISHED"}
@@ -337,6 +366,8 @@ class MJWORLD_PT_main(Panel):
             layout.prop(settings, "plane_conaffinity")
             layout.prop(settings, "object_contype")
             layout.prop(settings, "object_conaffinity")
+            layout.prop(settings, "hinge_contype")
+            layout.prop(settings, "hinge_conaffinity")
             layout.prop(settings, "movable_contype")
             layout.prop(settings, "movable_conaffinity")
             layout.operator("mjworld.walkie_contacts")

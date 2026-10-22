@@ -36,19 +36,19 @@ def capture_material_baselines(scene, root):
         obj["mjworld_material_baseline"] = json.dumps(snapshot, sort_keys=True)
 
 
-def update_authored_materials(scene, root, assets_path, asset_prefix=None):
+def update_authored_materials(scene, root, assets, asset_prefix, geoms):
     """Export changed simple colours/images per object, retaining source physics.
 
-    Complex shader changes still need the static bake. A reassigned material
-    gets a new material reference on that object rather than changing every
-    object that used the imported material.
+    ``geoms`` maps each exported adopted object to its geom element, and
+    ``assets`` is the export's AssetWriter. Complex shader changes still need
+    the static bake. A reassigned material gets a new material reference on
+    that object rather than changing every object that used the imported
+    material.
     """
     from .exporter import _write_image, numbers, property_numbers, slug, srgb
-    asset_prefix = assets_path.name if asset_prefix is None else asset_prefix
     asset = root.find("asset")
     if asset is None:
         asset = ET.SubElement(root, "asset")
-    geoms = {geom.get("name"): geom for geom in root.findall("./worldbody//geom")}
     warnings = []
     exported = {}
     for obj in scene.objects:
@@ -56,7 +56,7 @@ def update_authored_materials(scene, root, assets_path, asset_prefix=None):
         previous = obj.get("mjworld_material_baseline")
         if obj.type != "MESH" or not raw or previous is None:
             continue
-        geom = geoms.get(json.loads(raw).get("name"))
+        geom = geoms.get(obj)
         if geom is None or obj.mujoco_world.role == "COLLIDER" or obj.get("mjworld_bake_source"):
             continue
         info, snapshot = _description(obj)
@@ -78,8 +78,7 @@ def update_authored_materials(scene, root, assets_path, asset_prefix=None):
             attributes = {"name": label, "rgba": numbers(rgba), "specular": "0",
                           "emission": property_numbers([scene.mujoco_world.baked_emission if baked else 0])}
             if image:
-                filename = label + ".png"
-                _write_image(image, assets_path / filename, baked=baked, scene=scene)
+                filename = assets.write(label + ".png", lambda target: _write_image(image, target, baked=baked, scene=scene))
                 ET.SubElement(asset, "texture", name=label + "_texture", type="2d",
                               file=asset_prefix + "/" + filename,
                               colorspace="linear" if scene.mujoco_world.texture_mode == "DISPLAY" else "sRGB")

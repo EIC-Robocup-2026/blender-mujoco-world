@@ -9,7 +9,6 @@ import hashlib
 import json
 import math
 from pathlib import Path
-import shutil
 import tempfile
 import xml.etree.ElementTree as ET
 
@@ -210,41 +209,42 @@ def adopt_mjcf(context, filepath, *, object_map=None):
     candidates = {obj.name: obj for obj in scene.objects}
     def find(name):
         return candidates.get(mapping.get(name, name))
+    # First resolve and check everything, then change the scene, so a rejected
+    # adoption leaves the previous adoption and every setting untouched.
     missing_bodies, missing_geoms = [], []
-    body_count = geom_count = 0
-    for obj in scene.objects:
-        for key in ("mjworld_mjcf_body", "mjworld_mjcf_geom", "mjworld_mjcf_children", "mjworld_mjcf_original_scale"):
-            if key in obj:
-                del obj[key]
-        if obj.type == "MESH" and obj.get("simulation_geometry"):
-            obj["mjworld_adopted_exclude"] = True
+    body_plans, geom_plans = [], []
     for source in root.findall("./worldbody//body"):
         obj = find(source.get("name", ""))
         if obj is None or obj.type != "EMPTY":
             missing_bodies.append(source.get("name", "<unnamed>"))
             continue
-        obj.mujoco_world.body = True
-        obj["mjworld_mjcf_body"] = json.dumps(dict(source.attrib))
+        name = source.get("name", "<unnamed>")
+        values = {"role": "FREE" if source.find("freejoint") is not None or source.find("joint[@type='free']") is not None else "HINGE" if source.find("joint") is not None else "STATIC"}
+        try:
+            inertial = source.find("inertial")
+            if inertial is not None and inertial.get("mass"):
+                values["mass"] = float(inertial.get("mass"))
+            joint = source.find("joint[@type='hinge']")
+            if joint is not None:
+                degree = compiler is None or compiler.get("angle", "degree") == "degree"
+                conversion = 1.0 if degree else 180.0 / math.pi
+                # The fallback is the add-on's default door, already in degrees.
+                limits = [float(v) * conversion for v in joint.get("range").split()] if joint.get("range") else [-110.0, 0.0]
+                if len(limits) != 2:
+                    raise ExportError(f"Body '{name}': its hinge range needs two numbers.")
+                values["hinge_min"], values["hinge_max"] = limits
+                values["hinge_start"] = float(joint.get("ref", "0")) * conversion
+                values["damping"] = float(joint.get("damping", "0"))
+                axis = [float(v) for v in joint.get("axis", "0 0 1").split()]
+                if len(axis) != 3:
+                    raise ExportError(f"Body '{name}': its hinge axis needs three numbers.")
+                values["hinge_axis"] = "XYZ"[max(range(3), key=lambda i: abs(axis[i]))]
+        except ValueError as exc:
+            if isinstance(exc, ExportError):
+                raise
+            raise ExportError(f"Body '{name}': its inertial or joint attributes must contain numbers.") from exc
         children = [ET.tostring(node, encoding="unicode") for node in source if node.tag not in {"body", "geom"}]
-        obj["mjworld_mjcf_children"] = json.dumps(children)
-        role = "FREE" if source.find("freejoint") is not None or source.find("joint[@type='free']") is not None else "HINGE" if source.find("joint") is not None else "STATIC"
-        obj.mujoco_world.role = role
-        inertial = source.find("inertial")
-        if inertial is not None and inertial.get("mass"):
-            obj.mujoco_world.mass = float(inertial.get("mass"))
-        joint = source.find("joint[@type='hinge']")
-        if joint is not None:
-            degree = compiler is None or compiler.get("angle", "degree") == "degree"
-            conversion = 1.0 if degree else 180.0 / math.pi
-            # The fallback is the add-on's default door, already in degrees.
-            limits = [float(v) * conversion for v in joint.get("range").split()] if joint.get("range") else [-110.0, 0.0]
-            obj.mujoco_world.hinge_min, obj.mujoco_world.hinge_max = limits
-            obj.mujoco_world.hinge_start = float(joint.get("ref", "0")) * conversion
-            obj.mujoco_world.damping = float(joint.get("damping", "0"))
-            axis = [float(v) for v in joint.get("axis", "0 0 1").split()]
-            obj.mujoco_world.hinge_axis = "XYZ"[max(range(3), key=lambda i: abs(axis[i]))]
-        obj["mjworld_settings_baseline"] = json.dumps({key: getattr(obj.mujoco_world, key) for key in ("role", "mass", "hinge_min", "hinge_max", "hinge_start", "hinge_axis", "damping")})
-        body_count += 1
+        body_plans.append((obj, dict(source.attrib), children, values))
     world_geoms = list(root.findall("./worldbody/geom"))
     for source in root.findall("./worldbody//geom"):
         obj = find(source.get("name", ""))
@@ -258,8 +258,6 @@ def adopt_mjcf(context, filepath, *, object_map=None):
             missing_geoms.append(source.get("name", "<unnamed>"))
             continue
         attrs = dict(source.attrib)
-        obj["mjworld_mjcf_geom"] = json.dumps(attrs)
-        obj["mjworld_adopted_exclude"] = False
         scale = list(_scale(obj.matrix_world))
         bounds = [list(v) for v in obj.bound_box]
         # Legacy primitive authoring metadata identifies unit box/cylinder/
@@ -284,31 +282,60 @@ def adopt_mjcf(context, filepath, *, object_map=None):
             elif kind == "capsule":
                 scale, half = [1, 1, 1], [size[0], size[0], size[0] + size[1]]
             bounds = [[x * half[0], y * half[1], z * half[2]] for x in (-1, 1) for y in (-1, 1) for z in (-1, 1)]
-        obj["mjworld_mjcf_original_scale"] = scale
-        obj["mjworld_mjcf_original_bounds"] = json.dumps(bounds)
-        # Explicit helpers remain exportable even inside hidden collections.
         collision_only = obj.get("collision_only") or attrs.get("rgba", "").split()[-1:] == ["0"]
         visual_only = obj.get("visual_only") or (attrs.get("contype") == attrs.get("conaffinity") == "0") or "visual" in attrs.get("class", "").lower()
         if obj.get("preserved_original_static_visual"):
-            obj["mjworld_bake_source"] = True
-            obj.mujoco_world.role = "VISUAL" if visual_only else "STATIC"
+            role = "VISUAL" if visual_only else "STATIC"
         else:
-            obj.mujoco_world.role = "COLLIDER" if collision_only else "VISUAL" if visual_only else "STATIC"
+            role = "COLLIDER" if collision_only else "VISUAL" if visual_only else "STATIC"
+        emission = None
         if obj.get("baked_static_visual") or obj.get("mjworld_baked_atlas"):
             material = root.find(f"./asset/material[@name='{attrs.get('material')}']")
             if material is not None:
-                scene.mujoco_world.baked_emission = float(material.get("emission", ".2"))
-        geom_count += 1
+                try:
+                    emission = float(material.get("emission", ".2"))
+                except ValueError as exc:
+                    raise ExportError(f"Material '{attrs.get('material')}': emission must be a number.") from exc
+        geom_plans.append((obj, attrs, scale, bounds, role, emission))
     if missing_bodies or missing_geoms:
         # A partial adoption can silently erase collision geometry. Do not allow
         # it to become the active project; report every missing physics source.
         raise ExportError("MJCF names were not found in this Blender scene. Bodies: " + ", ".join(missing_bodies[:10]) + "; geoms: " + ", ".join(missing_geoms[:10]) + ". Use object_map for renamed objects.")
+    for obj in scene.objects:
+        for key in ("mjworld_mjcf_body", "mjworld_mjcf_geom", "mjworld_mjcf_children", "mjworld_mjcf_original_scale",
+                    "mjworld_mjcf_original_bounds", "mjworld_settings_baseline", "mjworld_mjcf_owner"):
+            if key in obj:
+                del obj[key]
+        if obj.type == "MESH" and obj.get("simulation_geometry"):
+            obj["mjworld_adopted_exclude"] = True
+    for obj, attrs, children, values in body_plans:
+        obj.mujoco_world.body = True
+        obj["mjworld_mjcf_body"] = json.dumps(attrs)
+        obj["mjworld_mjcf_children"] = json.dumps(children)
+        # Copies made later with Shift+D carry this too; export uses it to keep
+        # the adopted name on this object only.
+        obj["mjworld_mjcf_owner"] = obj.name
+        for key, value in values.items():
+            setattr(obj.mujoco_world, key, value)
+        obj["mjworld_settings_baseline"] = json.dumps({key: getattr(obj.mujoco_world, key) for key in ("role", "mass", "hinge_min", "hinge_max", "hinge_start", "hinge_axis", "damping")})
+    for obj, attrs, scale, bounds, role, emission in geom_plans:
+        obj["mjworld_mjcf_geom"] = json.dumps(attrs)
+        obj["mjworld_mjcf_owner"] = obj.name
+        obj["mjworld_adopted_exclude"] = False
+        obj["mjworld_mjcf_original_scale"] = scale
+        obj["mjworld_mjcf_original_bounds"] = json.dumps(bounds)
+        # Explicit helpers remain exportable even inside hidden collections.
+        if obj.get("preserved_original_static_visual"):
+            obj["mjworld_bake_source"] = True
+        obj.mujoco_world.role = role
+        if emission is not None:
+            scene.mujoco_world.baked_emission = emission
     scene["mjworld_mjcf_template"] = ET.tostring(root, encoding="unicode")
     scene["mjworld_mjcf_source"] = bpy.path.relpath(str(filepath)) if bpy.data.filepath else str(filepath)
     scene["mjworld_mjcf_adoption_version"] = 1
     from .authored_materials import capture_material_baselines
     capture_material_baselines(scene, root)
-    return {"bodies": body_count, "geoms": geom_count, "source": str(filepath)}
+    return {"bodies": len(body_plans), "geoms": len(geom_plans), "source": str(filepath)}
 
 
 def group_selected(context, role="FREE"):
@@ -373,11 +400,52 @@ def validate_parts(scene, objects, labels):
             check_door(owner)
 
 
-def regroup_export(context, filepath, report):
-    """Lift exported parts into compound bodies, retaining relative transforms."""
-    from .exporter import ExportError, check_door, door_radians, mask_value, numbers, property_numbers, property_value, xml_path
-    path = xml_path(filepath)
-    root = ET.parse(path).getroot()
+def moving_role(owner):
+    """FREE or HINGE when body ``owner`` moves with such a body (itself included), else None.
+
+    Matches robot_bringup.world_loader, which treats every geom below a joint
+    as a moving object.
+    """
+    while owner is not None:
+        if owner.mujoco_world.role in {"FREE", "HINGE"}:
+            return owner.mujoco_world.role
+        owner = body_owner(owner)
+    return None
+
+
+def check_evaluated(context, objects):
+    """Refuse objects whose placement and modifiers Blender does not evaluate.
+
+    Objects disabled in viewports (the monitor icon, on the object or any of its
+    collections) or in a collection excluded from the view layer keep a stale
+    matrix_world when a parent moves, and their modifiers are not applied.
+    Hiding with the eye icon keeps them evaluated, so that is the supported way
+    to hide collision helpers.
+    """
+    from .exporter import ExportError
+    enabled = set()
+    def walk(layer, parent_enabled):
+        on = parent_enabled and not layer.exclude and not layer.collection.hide_viewport
+        if on:
+            enabled.update(layer.collection.objects)
+        for child in layer.children:
+            walk(child, on)
+    walk(context.view_layer.layer_collection, True)
+    stale = [obj.name for obj in objects if obj.hide_viewport or obj not in enabled]
+    if stale:
+        raise ExportError(", ".join(stale[:10]) + (" and others" if len(stale) > 10 else "") +
+                          ": disabled in viewports (monitor icon) or in a collection excluded from the view layer, so Blender "
+                          "does not update their placement or modifiers. Enable them, and use the eye icon (Hide in Viewport) "
+                          "to hide helpers instead.")
+
+
+def regroup_export(context, root, report):
+    """Lift exported parts into compound bodies, retaining relative transforms.
+
+    Works on the in-memory world from the ordinary exporter, before any file
+    is written.
+    """
+    from .exporter import ExportError, check_door, door_radians, numbers, property_numbers, property_value, role_masks
     world = root.find("worldbody")
     unit = context.scene.unit_settings.scale_length
     settings = context.scene.mujoco_world
@@ -423,34 +491,37 @@ def regroup_export(context, filepath, report):
             if original is None:
                 continue
             relative = inverse @ _rigid(obj.matrix_world, unit)
+            # Doors and movable objects inside a moving body move with it, so
+            # they take its contact masks (robot_bringup.world_loader agrees).
+            contype, conaffinity = role_masks(settings, moving_role(owner))
             for geom in list(original.findall("geom")):
                 pose = relative @ _matrix(geom.attrib)
                 geom.attrib.update(_pose(pose))
                 if geom.get("contype") != "0":
-                    movable = owner.mujoco_world.role == "FREE"
-                    geom.set("contype", mask_value(settings, "movable_contype" if movable else "object_contype"))
-                    geom.set("conaffinity", mask_value(settings, "movable_conaffinity" if movable else "object_conaffinity"))
+                    geom.set("contype", contype)
+                    geom.set("conaffinity", conaffinity)
                     geom.set("mass", numbers([property_value(owner.mujoco_world.mass) / len(colliders)]) if owner.mujoco_world.role in {"FREE", "HINGE"} else "0")
                 target.append(geom)
             world.remove(original)
             detail["body"] = owner.name
             detail["body_role"] = owner.mujoco_world.role
-    ET.indent(root, space="  ")
-    ET.ElementTree(root).write(path, encoding="utf-8", xml_declaration=True)
     report["compound_bodies"] = len(groups)
     grouped_names = {obj.name for parts in groups.values() for obj, _d in parts}
     report["warnings"] = [w for w in report["warnings"] if not any(w.startswith(name + ": parent transforms") for name in grouped_names)]
-    (path.parent / "export_report.json").write_text(json.dumps(report, indent=2) + "\n")
     return report
 
 
-def _append_new_parts(context, objects, root, world, asset, assets_path, make_body, warnings, asset_prefix=None):
-    """Use the ordinary exporter for newly added furniture and compound props."""
-    from .exporter import _export_simple, ExportError, mask_value, numbers, property_numbers, property_value, slug
+def _append_new_parts(context, objects, root, world, asset, assets, make_body, warnings, asset_prefix):
+    """Use the ordinary exporter for newly added furniture and compound props.
+
+    Their files go through ``assets``, the adopted export's AssetWriter. Parts
+    grouped under a body get mass 0 here; export_adopted distributes the
+    body's Weight afterwards when the body needs it.
+    """
+    from .exporter import _export_simple, property_numbers, role_masks, slug
     if not objects:
         return []
     scene = context.scene
-    asset_prefix = assets_path.name if asset_prefix is None else asset_prefix
     selected, active = list(context.selected_objects), context.view_layer.objects.active
     only = scene.mujoco_world.selected_only
     asset_directory = scene.mujoco_world.asset_directory
@@ -480,10 +551,7 @@ def _append_new_parts(context, objects, root, world, asset, assets_path, make_bo
                         element.set(field, rename[element.get(field)])
                 if element.get("file"):
                     original = Path(temporary) / "parts_assets" / element.get("file")
-                    target = assets_path / (slug(rename[old_name]) + original.suffix)
-                    if original.resolve() != target.resolve():
-                        shutil.copyfile(original, target)
-                    element.set("file", asset_prefix + "/" + target.name)
+                    element.set("file", asset_prefix + "/" + assets.copy(original, slug(rename[old_name]) + original.suffix))
                 asset.append(element)
             details = report["object_details"]
             groups = {}
@@ -493,9 +561,8 @@ def _append_new_parts(context, objects, root, world, asset, assets_path, make_bo
                 groups.setdefault(owner, []).append((obj, detail))
             for owner, members in groups.items():
                 target = make_body(owner) if owner else world
-                collision_count = sum(bool(d["collision"]) for _o, d in members)
-                if owner and owner.mujoco_world.role in {"FREE", "HINGE"} and not owner.get("mjworld_mjcf_body") and not collision_count:
-                    raise ExportError(f"{owner.name}: a movable body needs at least one collision helper.")
+                if owner:
+                    contype, conaffinity = role_masks(scene.mujoco_world, moving_role(owner))
                 for obj, detail in members:
                     body = parts_root.find(f"./worldbody/body[@name='{detail['body']}']")
                     # The part export is always in radians; follow the adopted
@@ -515,11 +582,9 @@ def _append_new_parts(context, objects, root, world, asset, assets_path, make_bo
                         for geom in list(body.findall("geom")):
                             geom.attrib.update(_pose(relative @ _matrix(geom.attrib)))
                             if geom.get("contype") != "0":
-                                movable = owner.mujoco_world.role == "FREE"
-                                geom.set("contype", mask_value(scene.mujoco_world, "movable_contype" if movable else "object_contype"))
-                                geom.set("conaffinity", mask_value(scene.mujoco_world, "movable_conaffinity" if movable else "object_conaffinity"))
-                                movable_body = owner.mujoco_world.role in {"FREE", "HINGE"} and not owner.get("mjworld_mjcf_body")
-                                geom.set("mass", numbers([property_value(owner.mujoco_world.mass) / collision_count]) if movable_body else "0")
+                                geom.set("contype", contype)
+                                geom.set("conaffinity", conaffinity)
+                                geom.set("mass", "0")
                             target.append(geom)
                     else:
                         target.append(body)
@@ -569,10 +634,118 @@ def _primitive_size(obj, attrs):
     return numbers(size)
 
 
+def _default_chains(root):
+    """Map each <default> class to its chain of <default> elements, outermost first."""
+    chains = {}
+    def walk(element, chain):
+        chain = chain + [element]
+        chains[element.get("class", "main")] = chain
+        for child in element.findall("default"):
+            walk(child, chain)
+    for top in root.findall("default"):
+        walk(top, [])
+    return chains
+
+
+def _effective(attrs, chains, class_name, tag, field):
+    """An MJCF attribute, explicit or inherited from the element's default class."""
+    if field in attrs:
+        return attrs[field]
+    for default in reversed(chains.get(class_name or "main", chains.get("main", []))):
+        element = default.find(tag)
+        if element is not None and field in element.attrib:
+            return element.get(field)
+    return None
+
+
+# Mesh asset attributes that change physics rather than geometry. The exporter
+# rewrites the vertices, so scale and reference frames are not carried.
+_MESH_PHYSICS = ("inertia", "maxhullvert", "smoothnormal")
+
+
+def _mesh_physics(source_mesh, chains):
+    """Physics attributes of an adopted mesh asset, including class defaults."""
+    if source_mesh is None:
+        return {}
+    attrs = dict(source_mesh.attrib)
+    values = {field: _effective(attrs, chains, attrs.get("class", "main"), "mesh", field) for field in _MESH_PHYSICS}
+    return {field: value for field, value in values.items() if value is not None}
+
+
+def _contributes_inertia(attrs, chains, class_name, compiler):
+    """Whether a geom adds mass and inertia to its body."""
+    def value(field):
+        return _effective(attrs, chains, class_name, "geom", field)
+    if compiler.get("inertiafromgeom") == "false":
+        return False
+    try:
+        if value("mass") is not None:
+            return float(value("mass")) > 0
+        if value("density") is not None and float(value("density")) == 0:
+            return False
+        low, high = (int(v) for v in compiler.get("inertiagrouprange", "0 5").split())
+        return low <= int(value("group") or 0) <= high
+    except ValueError:
+        return True
+
+
+def _collides(attrs, chains, class_name):
+    """Whether a geom takes part in contacts (contype or conaffinity non-zero)."""
+    try:
+        return any(int(_effective(attrs, chains, class_name, "geom", field) or 1) for field in ("contype", "conaffinity"))
+    except ValueError:
+        return True
+
+
+def _adopted_copies(bodies, geoms, root):
+    """Fresh MJCF names for copies of adopted objects.
+
+    Duplicating an adopted object (Shift+D) also copies its adopted physics,
+    including the MJCF name. Where several objects claim one name, the object
+    adopted under it keeps it: its ``mjworld_mjcf_owner`` (the Blender name at
+    adoption) matches its current name or, in projects adopted before that
+    property existed, its Blender name is the MJCF name. Every other claimant
+    is a new copy with a fresh name. Returns ``({obj: name}, unique)``, where
+    ``unique(base)`` reserves another unused name.
+    """
+    from .exporter import ExportError, slug
+    taken = {element.get("name") for element in root.iter() if element.get("name")}
+    def unique(base):
+        candidate, number = base, 1
+        while candidate in taken:
+            candidate, number = f"{base}_{number}", number + 1
+        taken.add(candidate)
+        return candidate
+    claims = {}
+    for kind, key, objects in (("body", "mjworld_mjcf_body", bodies), ("geom", "mjworld_mjcf_geom", geoms)):
+        for obj in objects:
+            name = _json(obj, key, {}).get("name")
+            if name:
+                claims.setdefault((kind, name), []).append(obj)
+    fresh = {}
+    for (kind, name), claimants in sorted(claims.items()):
+        if len(claimants) == 1:
+            continue
+        owners = [obj for obj in claimants if obj.get("mjworld_mjcf_owner", name) == obj.name]
+        if len(owners) != 1:
+            raise ExportError(f"Several objects carry the adopted MJCF {kind} '{name}': " +
+                              ", ".join(sorted(obj.name for obj in claimants)[:10]) +
+                              ". Give the original object its adopted name again (or adopt the world again); "
+                              "the others then export as new copies.")
+        for obj in sorted(claimants, key=lambda o: o.name):
+            if obj is not owners[0]:
+                fresh[obj] = unique(slug(obj.name))
+    return fresh, unique
+
+
 def export_adopted(context, filepath):
-    """Export retained physics and live Blender geometry as a portable world."""
-    from .exporter import (ExportError, _extract_geometry, _write_obj, _write_image, _asset_paths, check_door, numbers,
-                           inspect_material, property_numbers, property_value, slug, xml_path)
+    """Export retained physics and live Blender geometry as a portable world.
+
+    Everything is validated and built in memory first; asset files are staged
+    or placed through an AssetWriter, and the XML and report replace the
+    previous ones only at the end, so a failed export keeps the last good one.
+    """
+    from .exporter import AssetWriter, ExportError, _asset_paths, write_text, write_xml, xml_path
     if context.mode != "OBJECT":
         raise ExportError("Switch to Object Mode before exporting.")
     scene = context.scene
@@ -580,9 +753,21 @@ def export_adopted(context, filepath):
     if settings.selected_only:
         raise ExportError("An adopted physics project exports the complete world. Turn off 'Export selected objects only' so joint, contact and keyframe references remain valid.")
     path = xml_path(filepath)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    assets_path, asset_prefix, shared_assets = _asset_paths(scene, path)
+    unit = float(scene.unit_settings.scale_length)
+    if unit <= 0:
+        raise ExportError("Scene unit scale must be positive.")
+    objects = sorted({o for o in scene.objects if o.type == "MESH" and not o.get("mjworld_adopted_exclude") and _included(o) and (o.get("mjworld_mjcf_geom") or o.get("mjworld_baked_atlas") or (o.visible_get() and not o.hide_render))}, key=lambda o: o.name)
+    if not objects:
+        raise ExportError("No mesh objects selected for export.")
+    adopted_bodies = [o for o in scene.objects if is_body(o) and o.get("mjworld_mjcf_body") and _included(o)]
+    owners = {owner for obj in objects for owner in [body_owner(obj)] if owner}
+    check_evaluated(context, objects + sorted(owners | set(adopted_bodies), key=lambda o: o.name))
     root = ET.fromstring(scene["mjworld_mjcf_template"])
+    def skipped(obj):
+        # Bake sources that only provided appearance are replaced by the atlas.
+        return bool(obj.get("mjworld_bake_source") or obj.get("preserved_original_static_visual")) and obj.mujoco_world.role == "VISUAL"
+    fresh, unique = _adopted_copies(adopted_bodies, [o for o in objects if o.get("mjworld_mjcf_geom") and not skipped(o)], root)
+    chains = _default_chains(root)
     source = _resolved_path(scene["mjworld_mjcf_source"])
     compiler = root.find("compiler")
     if compiler is None:
@@ -594,23 +779,51 @@ def export_adopted(context, filepath):
     if asset is None:
         asset = ET.SubElement(root, "asset")
     warnings = []
+    path.parent.mkdir(parents=True, exist_ok=True)
+    assets_path, asset_prefix, shared_assets = _asset_paths(scene, path)
+    assets = AssetWriter(assets_path, shared_assets)
+    try:
+        report = _build_adopted(context, path, root, compiler, asset, source, source_meshdir, source_texturedir, objects,
+                                adopted_bodies, fresh, unique, chains, unit, assets, asset_prefix, warnings)
+        assets.commit()
+        write_xml(root, path)
+        write_text(path.parent / "export_report.json", json.dumps(report, indent=2) + "\n")
+    finally:
+        assets.close()
+    return report
+
+
+def _build_adopted(context, path, root, compiler, asset, source, source_meshdir, source_texturedir, objects,
+                   adopted_bodies, fresh, unique, chains, unit, assets, asset_prefix, warnings):
+    """Build the adopted world in memory; asset files go through ``assets``."""
+    from .exporter import (ExportError, _extract_geometry, _write_obj, _write_image, check_door, numbers,
+                           inspect_material, property_numbers, property_value, slug)
+    scene = context.scene
+    settings = scene.mujoco_world
     # Preserve original material/solver/default declarations. Asset files are
     # copied into one sibling directory so exports never depend on author paths.
     # Every referenced mesh is exported from current Blender geometry below;
     # carrying the old files too would duplicate task meshes on every export.
+    # The source declarations still supply each mesh's physics attributes.
+    def source_file(element):
+        filename = element.get("file")
+        directory = source_meshdir if element.tag == "mesh" else source_texturedir
+        return Path(filename) if Path(filename).is_absolute() else source.parent / directory / filename
+    # An export may target the source world's own folder; its files are never removed.
+    for element in asset:
+        if element.get("file"):
+            assets.protect(source_file(element))
+    source_meshes = {element.get("name"): element for element in asset.findall("mesh")}
     for element in list(asset.findall("mesh")):
         asset.remove(element)
     for index, element in enumerate(asset):
         filename = element.get("file")
         if filename:
-            directory = source_meshdir if element.tag == "mesh" else source_texturedir
-            original = Path(filename) if Path(filename).is_absolute() else source.parent / directory / filename
-            target = assets_path / (slug(element.get("name", f"asset_{index}")) + Path(filename).suffix.lower())
+            original = source_file(element)
             if not original.exists():
                 raise ExportError(f"Missing adopted asset: {original}. Keep the source world assets beside the saved project.")
-            if original.resolve() != target.resolve():
-                shutil.copyfile(original, target)
-            element.set("file", asset_prefix + "/" + target.name)
+            name = slug(element.get("name", f"asset_{index}")) + Path(filename).suffix.lower()
+            element.set("file", asset_prefix + "/" + assets.copy(original, name))
     original_world = root.find("worldbody")
     world = ET.Element("worldbody", original_world.attrib)
     # Retain lights/cameras/sites and world-level physics declarations. Bodies
@@ -620,19 +833,10 @@ def export_adopted(context, filepath):
             world.append(copy.deepcopy(element))
     root.remove(original_world)
     root.append(world)
-    unit = float(scene.unit_settings.scale_length)
-    if unit <= 0:
-        raise ExportError("Scene unit scale must be positive.")
     depsgraph = context.evaluated_depsgraph_get()
-    candidates = list(context.selected_objects) if settings.selected_only else list(scene.objects)
-    if settings.selected_only:
-        for obj in list(candidates):
-            if is_body(obj):
-                candidates.extend(obj.children_recursive)
-    objects = sorted({o for o in candidates if o.type == "MESH" and not o.get("mjworld_adopted_exclude") and _included(o) and (o.get("mjworld_mjcf_geom") or o.get("mjworld_baked_atlas") or (o.visible_get() and not o.hide_render))}, key=lambda o: o.name)
-    if not objects:
-        raise ExportError("No mesh objects selected for export.")
     bodies = {}
+    # The childclass each body passes on to its geoms, for default lookups.
+    childclass = {world: None}
     angle_factor = math.pi / 180 if compiler.get("angle", "degree") == "radian" else 1.0
     def door_angles(cfg):
         """Door limits and starting angle in the adopted world's angle unit."""
@@ -652,9 +856,21 @@ def export_adopted(context, filepath):
             for field in ("euler", "axisangle", "xyaxes", "zaxis"):
                 attrs.pop(field, None)
             attrs.update(_pose(transform))
+        children = [ET.fromstring(xml) for xml in _json(obj, "mjworld_mjcf_children", [])]
+        if obj in fresh:
+            # A copy of an adopted body: same physics, new body, joint and site names.
+            old_name = attrs.get("name", "")
+            attrs["name"] = fresh[obj]
+            for element in (node for child in children for node in child.iter()):
+                if element.get("name"):
+                    name = element.get("name")
+                    suffix = name[len(old_name):] if old_name and name.startswith(old_name) else "_" + name
+                    element.set("name", unique(fresh[obj] + suffix))
+            warnings.append(f"{obj.name}: copy of adopted body '{old_name}', exported as body '{fresh[obj]}'.")
         body = ET.SubElement(parent, "body", **attrs)
-        for xml in _json(obj, "mjworld_mjcf_children", []):
-            body.append(ET.fromstring(xml))
+        childclass[body] = attrs.get("childclass") or childclass[parent]
+        for child in children:
+            body.append(child)
         cfg = obj.mujoco_world
         baseline = _json(obj, "mjworld_settings_baseline", {})
         if not obj.get("mjworld_mjcf_body"):
@@ -714,7 +930,7 @@ def export_adopted(context, filepath):
         return body
     # Retain source body/joint indexing, including bodies that only contain
     # children or sensors, so unchanged keyframes keep their original meaning.
-    imported_bodies = {_json(o, "mjworld_mjcf_body", {}).get("name"): o for o in scene.objects if is_body(o) and o.get("mjworld_mjcf_body") and _included(o)}
+    imported_bodies = {_json(o, "mjworld_mjcf_body", {}).get("name"): o for o in adopted_bodies if o not in fresh}
     for definition in original_world.iter("body"):
         obj = imported_bodies.get(definition.get("name"))
         if obj is not None:
@@ -723,6 +939,7 @@ def export_adopted(context, filepath):
     mesh_cache = {}
     new_parts = []
     plane_count = 0
+    geom_elements = {}
     for index, obj in enumerate(objects):
         attrs = _json(obj, "mjworld_mjcf_geom")
         owner = body_owner(obj)
@@ -733,6 +950,9 @@ def export_adopted(context, filepath):
             kind = attrs.get("type", "sphere")
             if baked_source and obj.mujoco_world.role == "VISUAL":
                 continue
+            if obj in fresh:
+                warnings.append(f"{obj.name}: copy of adopted geom '{attrs.get('name')}', exported as geom '{fresh[obj]}'.")
+                attrs["name"] = fresh[obj]
             if baked_source or obj.mujoco_world.role == "COLLIDER":
                 attrs.update(group="3", rgba="0 0 0 0")
             transform = _rigid(obj.matrix_world, unit)
@@ -775,16 +995,24 @@ def export_adopted(context, filepath):
                 # Share identical evaluated shapes across repeated task props.
                 # Rounding only the cache key absorbs Blender float32 rotation
                 # noise; the written mesh retains full evaluated precision.
-                key = hashlib.sha256(json.dumps({"vertices": [[round(v, 5) for v in p] for p in geometry["vertices"]], "triangles": triangles, "uv": geometry["uv_layers"].get(uv_name)}, sort_keys=True).encode()).hexdigest()
+                # The regenerated mesh keeps the source mesh's inertia mode,
+                # convex hull limit and normals. Without a source mode, a mesh
+                # that adds no mass uses shell, which also accepts open or flat
+                # visual meshes; other meshes keep MuJoCo's default.
+                physics = _mesh_physics(source_meshes.get(attrs.get("mesh")), chains)
+                if "inertia" not in physics and not _contributes_inertia(attrs, chains, attrs.get("class") or childclass[target], compiler):
+                    physics["inertia"] = "shell"
+                physics = {field: physics[field] for field in _MESH_PHYSICS if field in physics}
+                key =hashlib.sha256(json.dumps({"vertices": [[round(v, 5) for v in p] for p in geometry["vertices"]], "triangles": triangles, "uv": geometry["uv_layers"].get(uv_name), "physics": physics}, sort_keys=True).encode()).hexdigest()
                 if key not in mesh_cache:
                     # The atlas may be matched to an unnamed source geom.
                     mesh_name = slug(attrs.get("name") or obj.name) + "_authored_mesh"
-                    _write_obj(assets_path / (mesh_name + ".obj"), geometry, triangles, uv_name)
-                    ET.SubElement(asset, "mesh", name=mesh_name, file=asset_prefix + "/" + mesh_name + ".obj", inertia="shell")
+                    mesh_file = assets.write(mesh_name + ".obj", lambda target_path: _write_obj(target_path, geometry, triangles, uv_name))
+                    ET.SubElement(asset, "mesh", name=mesh_name, file=asset_prefix + "/" + mesh_file, **physics)
                     mesh_cache[key] = mesh_name
                 mesh_name = mesh_cache[key]
                 attrs["mesh"] = mesh_name
-            ET.SubElement(target, "geom", **attrs)
+            geom_elements[obj] = ET.SubElement(target, "geom", **attrs)
             details.append({"source": obj.name, "body": owner.name if owner else "world", "role": obj.mujoco_world.role, "geometry": kind})
         else:
             # New static visual atlas: material comes from the current packed
@@ -800,39 +1028,67 @@ def export_adopted(context, filepath):
             material_args = {"name": label + "_material", "rgba": numbers(info["color"]), "specular": "0", "emission": property_numbers([settings.baked_emission])}
             image = info["image"]
             if image:
-                image_path = assets_path / (label + ".png")
-                _write_image(image, image_path, baked=True, scene=scene)
-                ET.SubElement(asset, "texture", name=label + "_texture", type="2d", file=asset_prefix + "/" + image_path.name, colorspace="linear")
+                image_file = assets.write(label + ".png", lambda target_path: _write_image(image, target_path, baked=True, scene=scene))
+                ET.SubElement(asset, "texture", name=label + "_texture", type="2d", file=asset_prefix + "/" + image_file, colorspace="linear")
                 material_args.update(texture=label + "_texture", rgba="1 1 1 1", texuniform="false")
             ET.SubElement(asset, "material", **material_args)
-            _write_obj(assets_path / (label + ".obj"), geometry, [tri for _m, tri in geometry["triangles"]], info.get("uv_map") or geometry["active_uv"])
-            ET.SubElement(asset, "mesh", name=label + "_mesh", file=asset_prefix + "/" + label + ".obj", inertia="shell")
+            mesh_file = assets.write(label + ".obj", lambda target_path: _write_obj(target_path, geometry, [tri for _m, tri in geometry["triangles"]], info.get("uv_map") or geometry["active_uv"]))
+            ET.SubElement(asset, "mesh", name=label + "_mesh", file=asset_prefix + "/" + mesh_file, inertia="shell")
             ET.SubElement(target, "geom", name=label, type="mesh", mesh=label + "_mesh", material=material_args["name"], contype="0", conaffinity="0", group="1", mass="0", **_pose(_rigid(obj.matrix_world, unit) if owner is None else _rigid(owner.matrix_world, unit).inverted() @ _rigid(obj.matrix_world, unit)))
             details.append({"source": obj.name, "body": owner.name if owner else "world", "role": "VISUAL", "geometry": "mesh"})
-    details.extend(_append_new_parts(context, new_parts, root, world, asset, assets_path, make_body, warnings, asset_prefix))
+    # Copies of adopted bodies are exported even when they hold no geoms.
+    for obj in sorted((o for o in fresh if is_body(o)), key=lambda o: o.name):
+        make_body(obj)
+    details.extend(_append_new_parts(context, new_parts, root, world, asset, assets, make_body, warnings, asset_prefix))
     if plane_count != 1:
         raise ExportError(f"This adopted world needs exactly one analytic floor plane; found {plane_count}.")
+    _apply_weights(bodies, childclass, chains, warnings)
     from .authored_materials import update_authored_materials
-    warnings.extend(update_authored_materials(scene, root, assets_path, asset_prefix))
+    warnings.extend(update_authored_materials(scene, root, assets, asset_prefix, geom_elements))
     # No duplicate legacy meshes/textures in runtime bundles. Defaults can carry
     # material references, so gather references across the entire XML tree.
     mesh_refs = {element.get("mesh") for element in root.iter() if element.get("mesh")}
     material_refs = {element.get("material") for element in root.iter() if element.get("material")}
     for element in list(asset):
         if (element.tag == "mesh" and element.get("name") not in mesh_refs) or (element.tag == "material" and element.get("name") not in material_refs):
-            file = element.get("file")
             asset.remove(element)
-            if file and not shared_assets:
-                (path.parent / file).unlink(missing_ok=True)
+            if element.get("file"):
+                assets.discard(path.parent / element.get("file"))
     texture_refs = {element.get("texture") for element in asset if element.get("texture")}
     for element in list(asset.findall("texture")):
         if element.get("name") not in texture_refs and element.get("type") != "skybox":
-            file = element.get("file")
             asset.remove(element)
-            if file and not shared_assets:
-                (path.parent / file).unlink(missing_ok=True)
-    ET.indent(root, space="  ")
-    ET.ElementTree(root).write(path, encoding="utf-8", xml_declaration=True)
-    report = {"addon_version": "0.2.0", "blender_version": bpy.app.version_string, "file": path.name, "objects": len(details), "bodies": len(bodies), "meshes": len(asset.findall("mesh")), "textures": len(asset.findall("texture")), "triangles": sum(len(o.data.polygons) for o in objects), "adopted_physics": True, "metres_per_blender_unit": unit, "object_details": details, "warnings": list(dict.fromkeys(warnings)), "plane": {"enabled": True, "name": "floor", "count": plane_count}}
-    (path.parent / "export_report.json").write_text(json.dumps(report, indent=2) + "\n")
-    return report
+            if element.get("file"):
+                assets.discard(path.parent / element.get("file"))
+    return {"addon_version": "0.2.0", "blender_version": bpy.app.version_string, "file": path.name, "objects": len(details), "bodies": len(bodies), "meshes": len(asset.findall("mesh")), "textures": len(asset.findall("texture")), "triangles": sum(len(o.data.polygons) for o in objects), "adopted_physics": True, "metres_per_blender_unit": unit, "object_details": details, "warnings": list(dict.fromkeys(warnings)), "plane": {"enabled": True, "name": "floor", "count": plane_count}}
+
+
+def _apply_weights(bodies, childclass, chains, warnings):
+    """Give movable bodies their Weight where the source inertia no longer applies.
+
+    New Movable/Door bodies, and adopted bodies without <inertial> whose role
+    or Weight changed, get the Weight split equally over their colliding geoms;
+    their other geoms get mass 0. Untouched adopted bodies keep their source
+    physics, and bodies with <inertial> are rescaled in make_body.
+    """
+    from .exporter import ExportError, numbers, property_value
+    for obj, body in bodies.items():
+        cfg = obj.mujoco_world
+        if cfg.role not in {"FREE", "HINGE"}:
+            continue
+        adopted = bool(obj.get("mjworld_mjcf_body"))
+        if adopted:
+            baseline = _json(obj, "mjworld_settings_baseline", {})
+            changed = cfg.role != baseline.get("role", cfg.role) or abs(cfg.mass - baseline.get("mass", cfg.mass)) > 1e-6
+            if body.find("inertial") is not None or not changed:
+                continue
+        geoms = body.findall("geom")
+        colliders = [geom for geom in geoms if _collides(geom.attrib, chains, geom.get("class") or childclass[body])]
+        if not colliders:
+            if not adopted:
+                raise ExportError(f"{obj.name}: add at least one collision helper before making this body movable.")
+            warnings.append(f"{obj.name}: its Weight was not applied because the body has no colliding geoms of its own.")
+            continue
+        share = numbers([property_value(cfg.mass) / len(colliders)])
+        for geom in geoms:
+            geom.set("mass", share if geom in colliders else "0")
