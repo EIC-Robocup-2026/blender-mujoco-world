@@ -716,7 +716,9 @@ def _append_new_parts(context, objects, root, world, asset, assets, make_body, w
                 owner = body_owner(obj)
                 groups.setdefault(owner, []).append((obj, detail))
             exported = {body.get("name"): body for body in parts_root.find("worldbody").findall("body")}
-            # Checked before any file is copied, so a refused export adds nothing to a shared folder.
+            # Checked before the new parts' own meshes and textures are copied. The
+            # adopted world's files are already written by now, so a refusal can
+            # still leave those in a shared folder.
             _check_part_names(world, groups, exported)
             names = {element.get("name") for element in asset}
             rename = {}
@@ -784,7 +786,6 @@ def _check_part_names(world, groups, exported):
     name. A grouped part contributes only its geoms to the owner's body.
     MuJoCo rejects a repeated name, so the export names the objects instead.
     """
-    from .exporter import ExportError
     taken = {kind: set() for kind in _NAME_KINDS.values()}
     for element in world.iter():
         if element.tag in _NAME_KINDS and element.get("name"):
@@ -801,8 +802,34 @@ def _check_part_names(world, groups, exported):
                     clashes.append(f"'{obj.name}' ({element.tag} '{name}')")
                 taken[kind].add(name)
     if clashes:
-        raise ExportError("New objects would repeat names the adopted world already uses, which MuJoCo rejects: "
-                          + ", ".join(clashes) + ". Rename these objects, then export again.")
+        raise _name_clash_error(clashes)
+
+
+def _check_generated_names(world, generated):
+    """Refuse bodies and joints named after Blender objects when the world already uses the name.
+
+    make_body names a new body group's body after its Empty, and the free
+    joint or hinge it adds to a new body, or to an adopted body whose role
+    changed, after the object (``<name>_free``, ``<name>_hinge``). A renamed
+    adopted object keeps its MJCF names, so another object can take its old
+    Blender name. ``generated`` lists those ``(object, element)`` pairs;
+    ``world`` is the complete worldbody before new parts are added.
+    """
+    counts = {}
+    for element in world.iter():
+        if element.tag in _NAME_KINDS and element.get("name"):
+            key = _NAME_KINDS[element.tag], element.get("name")
+            counts[key] = counts.get(key, 0) + 1
+    clashes = [f"'{obj.name}' ({element.tag} '{element.get('name')}')" for obj, element in generated
+               if counts.get((_NAME_KINDS[element.tag], element.get("name")), 0) > 1]
+    if clashes:
+        raise _name_clash_error(clashes)
+
+
+def _name_clash_error(clashes):
+    from .exporter import ExportError
+    return ExportError("Objects would repeat names the adopted world already uses, which MuJoCo rejects: "
+                       + ", ".join(clashes) + ". Rename these objects, then export again.")
 
 
 def _primitive_size(obj, attrs, resolved=None):
@@ -1237,6 +1264,8 @@ def _build_adopted(context, path, root, compiler, asset, source, directories, ob
     root.append(world)
     depsgraph = context.evaluated_depsgraph_get()
     bodies = {}
+    # (object, element) of each body and joint make_body names after a Blender object.
+    generated = []
     # The childclass each body passes on to its geoms, for default lookups.
     childclass = {world: None}
     angle_factor = math.pi / 180 if compiler.get("angle", "degree") == "radian" else 1.0
@@ -1283,16 +1312,17 @@ def _build_adopted(context, path, root, compiler, asset, source, directories, ob
         cfg = obj.mujoco_world
         baseline = _json(obj, "mjworld_settings_baseline", {})
         if not obj.get("mjworld_mjcf_body"):
+            generated.append((obj, body))
             if obj.mujoco_world.role == "FREE":
                 if owner:
                     raise ExportError(f"{obj.name}: a free body must be top-level.")
-                ET.SubElement(body, "freejoint", name=obj.name + "_free")
+                generated.append((obj, ET.SubElement(body, "freejoint", name=obj.name + "_free")))
             elif obj.mujoco_world.role == "HINGE":
                 check_door(obj)
                 axis = Vector({"X": (1, 0, 0), "Y": (0, 1, 0), "Z": (0, 0, 1)}[cfg.hinge_axis])
                 low, high, start = door_angles(cfg)
                 body.set("quat", numbers(transform.to_quaternion() @ Quaternion(axis, math.radians(property_value(cfg.hinge_start)))))
-                ET.SubElement(body, "joint", name=obj.name + "_hinge", type="hinge", axis=numbers(axis), range=numbers((low, high)), ref=numbers([start]), damping=property_numbers([cfg.damping]))
+                generated.append((obj, ET.SubElement(body, "joint", name=obj.name + "_hinge", type="hinge", axis=numbers(axis), range=numbers((low, high)), ref=numbers([start]), damping=property_numbers([cfg.damping]))))
         else:
             if cfg.role != baseline.get("role", cfg.role):
                 for node in list(body):
@@ -1301,14 +1331,14 @@ def _build_adopted(context, path, root, compiler, asset, source, directories, ob
                 if cfg.role == "FREE":
                     if owner:
                         raise ExportError(f"{obj.name}: a free body must be top-level.")
-                    ET.SubElement(body, "freejoint", name=obj.name + "_free")
+                    generated.append((obj, ET.SubElement(body, "freejoint", name=obj.name + "_free")))
                 elif cfg.role == "HINGE":
                     # The body keeps its adopted pose at the starting angle, so
                     # the closed pose need not be at 0.
                     check_door(obj, closed_at_zero=False)
                     axis = {"X": (1, 0, 0), "Y": (0, 1, 0), "Z": (0, 0, 1)}[cfg.hinge_axis]
                     low, high, start = door_angles(cfg)
-                    ET.SubElement(body, "joint", name=obj.name + "_hinge", type="hinge", axis=numbers(axis), range=numbers((low, high)), ref=numbers([start]), damping=property_numbers([cfg.damping]))
+                    generated.append((obj, ET.SubElement(body, "joint", name=obj.name + "_hinge", type="hinge", axis=numbers(axis), range=numbers((low, high)), ref=numbers([start]), damping=property_numbers([cfg.damping]))))
             inertial = body.find("inertial")
             if inertial is not None and abs(cfg.mass - baseline.get("mass", cfg.mass)) > 1e-6:
                 ratio = property_value(cfg.mass) / float(inertial.get("mass"))
@@ -1511,6 +1541,9 @@ def _build_adopted(context, path, root, compiler, asset, source, directories, ob
     # Copies of adopted bodies are exported even when they hold no geoms.
     for obj in sorted((o for o in fresh if is_body(o)), key=lambda o: o.name):
         make_body(obj)
+    # Every body exists now: the object loop made each object's owner, new parts' owners
+    # included, and the loop above made the copies.
+    _check_generated_names(world, generated)
     geom_sources = {element: obj for obj, element in geom_elements.items()}
     details.extend(_append_new_parts(context, new_parts, root, world, asset, assets, make_body, warnings, asset_prefix,
                                      geom_sources))
