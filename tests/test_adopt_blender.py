@@ -428,7 +428,11 @@ def weights():
     root = xml(target)
     stool_body = root.find(".//body[@name='Stool']")
     assert stool_body.find("freejoint") is not None
-    assert sorted(geom.get("mass") for geom in stool_body.findall("geom")) == ["1", "1"], [g.attrib for g in stool_body.findall("geom")]
+    # The Weight follows collider volume: seat 0.016 m3, leg 0.00144 m3.
+    stool_masses = {geom.get("name"): float(geom.get("mass")) for geom in stool_body.findall("geom")}
+    assert abs(stool_masses["Stool_seat"] - 2.0 * 0.016 / 0.01744) < 1e-7, stool_masses
+    assert abs(stool_masses["Stool_leg"] - 2.0 * 0.00144 / 0.01744) < 1e-7, stool_masses
+    assert abs(sum(stool_masses.values()) - 2.0) < 1e-7, stool_masses
     group_body = root.find(f".//body[@name='{group.name}']")
     masses = {geom.get("name"): geom.get("mass") for geom in group_body.findall("geom")}
     assert masses == {"Bench_top": "1.5", "Bench_visual": "0"}, masses
