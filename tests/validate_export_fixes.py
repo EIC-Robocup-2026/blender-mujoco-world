@@ -4,10 +4,10 @@ Run after the Blender fixture:
   python tests/validate_export_fixes.py OUTPUT_DIR [WALKIE_ROS_ROOT]
 
 With WALKIE_ROS_ROOT, the door world is also merged with the Walkie robot through
-robot_bringup.world_loader (read only) to confirm that the merged world compiles
-and that the robot keeps its own masses and inertias.
+a copy of robot_bringup.world_loader to confirm that the merged world compiles
+and that the robot keeps its own masses and inertias. The walkie-ros checkout
+is only read.
 """
-import importlib.util
 import json
 import math
 from pathlib import Path
@@ -17,10 +17,11 @@ import xml.etree.ElementTree as ET
 import mujoco
 import numpy as np
 
-if len(sys.argv) < 2:
-    raise SystemExit("usage: validate_export_fixes.py OUTPUT_DIR [WALKIE_ROS_ROOT]")
-OUT = Path(sys.argv[1]).resolve()
-WALKIE = Path(sys.argv[2]).resolve() if len(sys.argv) > 2 else None
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import harness  # noqa: E402
+
+OUT, ARGS, _ = harness.completed_output("export_fixes", "OUTPUT_DIR [WALKIE_ROS_ROOT]", 1, 2)
+WALKIE = Path(ARGS[0]).resolve() if ARGS else None
 summary = json.loads((OUT / "export_fixes.json").read_text())
 results = {}
 
@@ -75,10 +76,12 @@ for field in ("body_mass", "body_inertia", "body_ipos"):
     assert np.allclose(getattr(model, field), getattr(legacy, field), rtol=1e-9, atol=1e-12), field
 results["walkie_door"] = {"nq": model.nq, "nbody": model.nbody, "mass": float(model.body_mass.sum())}
 
-if WALKIE is not None:
-    spec = importlib.util.spec_from_file_location("world_loader", WALKIE / "bringup/robot_bringup/world_loader.py")
-    world_loader = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(world_loader)
+world_loader, skipped = (None, "no WALKIE_ROS_ROOT given") if WALKIE is None else \
+    harness.load_world_loader(WALKIE, OUT / "walkie_loader")
+if world_loader is None:
+    print("WALKIE_MERGE_SKIPPED", skipped)
+    results["walkie_merge"] = {"skipped": skipped}
+else:
     robot_path = WALKIE / "description/mujoco/walkie.xml"
     merged_root = world_loader.assemble_world(robot_path, scene, WALKIE / "description/mujoco/scene.xml")
     merged_path = OUT / "walkie_door_merged.xml"

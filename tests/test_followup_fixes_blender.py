@@ -13,7 +13,6 @@ with every failing section listed.
 import importlib
 import json
 from pathlib import Path
-import shutil
 import struct
 import sys
 import traceback
@@ -24,22 +23,17 @@ import bmesh
 import bpy
 from mathutils import Matrix
 
-ROOT = Path(__file__).resolve().parents[1]
-sys.path.insert(0, str(ROOT))
+sys.dont_write_bytecode = True  # Blender ignores PYTHONDONTWRITEBYTECODE.
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import harness  # noqa: E402
+
+OUT, _ = harness.begin("followup")
 import mujoco_world  # noqa: E402
 from mujoco_world import exporter  # noqa: E402
 from mujoco_world.baking import bake_static  # noqa: E402
 from mujoco_world.exporter import ExportError, export_world  # noqa: E402
 from mujoco_world.project import adopt_mjcf, group_selected  # noqa: E402
 
-assert Path(mujoco_world.__file__).resolve().parent == ROOT / "mujoco_world", mujoco_world.__file__
-mujoco_world.register()
-args = sys.argv[sys.argv.index("--") + 1:] if "--" in sys.argv else []
-if not args:
-    raise SystemExit("Pass an output directory after --")
-OUT = Path(args[0]).resolve()
-shutil.rmtree(OUT, ignore_errors=True)
-OUT.mkdir(parents=True)
 summary = {"sections": [], "failures": {}, "worlds": {}, "blender": bpy.app.version_string}
 VERSION = ".".join(str(part) for part in mujoco_world.bl_info["version"])
 CUBE_OBJ = ("v -0.1 -0.1 -0.1\nv 0.1 -0.1 -0.1\nv 0.1 0.1 -0.1\nv -0.1 0.1 -0.1\n"
@@ -750,4 +744,5 @@ def registration():
 (OUT / "followup.json").write_text(json.dumps(summary, indent=2, default=str) + "\n")
 if summary["failures"]:
     raise AssertionError("Failed sections: " + ", ".join(summary["failures"]))
+harness.complete(OUT, "followup", sections=summary["sections"])
 print("FOLLOWUP_FIXES_OK", json.dumps({"output": str(OUT), "sections": summary["sections"]}))

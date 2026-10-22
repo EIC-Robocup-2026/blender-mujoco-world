@@ -13,27 +13,20 @@ with every failing section listed.
 import hashlib
 import json
 from pathlib import Path
-import shutil
 import sys
 import traceback
 import xml.etree.ElementTree as ET
 
 import bpy
 
-ROOT = Path(__file__).resolve().parents[1]
-sys.path.insert(0, str(ROOT))
+sys.dont_write_bytecode = True  # Blender ignores PYTHONDONTWRITEBYTECODE.
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import harness  # noqa: E402
+
+OUT, _ = harness.begin("adopt")
 import mujoco_world  # noqa: E402
 from mujoco_world.exporter import ExportError, export_world  # noqa: E402
 from mujoco_world.project import adopt_mjcf, group_selected  # noqa: E402
-
-assert Path(mujoco_world.__file__).resolve().is_relative_to(ROOT), mujoco_world.__file__
-mujoco_world.register()
-args = sys.argv[sys.argv.index("--") + 1:] if "--" in sys.argv else []
-if not args:
-    raise SystemExit("Pass an output directory after --")
-OUT = Path(args[0]).resolve()
-shutil.rmtree(OUT, ignore_errors=True)
-OUT.mkdir(parents=True)
 
 CUBE_OBJ = ("v -0.1 -0.1 -0.1\nv 0.1 -0.1 -0.1\nv 0.1 0.1 -0.1\nv -0.1 0.1 -0.1\n"
             "v -0.1 -0.1 0.1\nv 0.1 -0.1 0.1\nv 0.1 0.1 0.1\nv -0.1 0.1 0.1\n"
@@ -565,6 +558,72 @@ def shared_folder_safe_names():
     return {"first": str(first), "second": str(second), "content_named": edited[0]}
 
 
+def resolved_assets(path):
+    """Resolved path of every asset file an exported world references."""
+    root = xml(path)
+    compiler = root.find("compiler")
+    return {element.get("name"): (path.parent / compiler.get("meshdir" if element.tag == "mesh" else "texturedir", "")
+                                  / element.get("file")).resolve()
+            for element in root.findall("./asset/*") if element.get("file")}
+
+
+@section
+def shared_folder_two_projects():
+    """Two adopted projects and an ordinary scene share one folder, like the variants of a room."""
+    directory = OUT / "shared_two_projects"
+    out = directory / "export"
+    shared = out / "scene_assets"
+    variants = {"low": (directory / "low", out / "scene.xml"),
+                "realistic": (directory / "realistic", out / "realistic" / "scene.xml")}
+    blue = [0.1, 0.3, 0.8, 1] * 16
+
+    def export_variant(name):
+        source_directory, target = variants[name]
+        build_world(source_directory)
+        if name == "realistic":
+            # Same texture file name as the other project, different content.
+            image = bpy.data.images["crate_tex"]
+            image.pixels[:] = blue
+            image.save()
+        adopt_mjcf(bpy.context, str(source_directory / "scene.xml"))
+        bpy.context.scene.mujoco_world.asset_directory = str(shared)
+        export_world(bpy.context, str(target))
+        return target
+
+    listings = []
+    for _repetition in range(2):
+        for name in variants:
+            export_variant(name)
+        listings.append(sorted(p.name for p in shared.iterdir()))
+    assert listings[0] == listings[1], "repeating both exports changed the shared folder"
+    assert not (shared / ".mujoco_world_manifest.json").exists(), "a shared folder must not get a manifest"
+    files = {name: resolved_assets(target) for name, (_source, target) in variants.items()}
+    for name, assets in files.items():
+        assert all(path.parent == shared and path.is_file() for path in assets.values()), (name, assets)
+    low_crate, realistic_crate = files["low"]["crate_tex"], files["realistic"]["crate_tex"]
+    assert low_crate != realistic_crate, "two different textures share one file"
+    for crate, (source_directory, _target) in ((low_crate, variants["low"]), (realistic_crate, variants["realistic"])):
+        source = source_directory / "scene_assets" / "crate_tex.png"
+        assert crate.read_bytes() == source.read_bytes(), crate
+    # An ordinary scene exports into the same folder through relative paths.
+    fresh_scene()
+    bpy.ops.mesh.primitive_plane_add(size=4)
+    bpy.context.object.mujoco_world.role = "VISUAL"
+    box("Ordinary_crate", (0, 0, 0.5), (0.1, 0.1, 0.1), "FREE")
+    bpy.context.scene.mujoco_world.asset_directory = str(shared)
+    ordinary = out / "ordinary" / "scene.xml"
+    export_world(bpy.context, str(ordinary))
+    compiler = xml(ordinary).find("compiler")
+    assert compiler.get("meshdir") == compiler.get("texturedir") == "../scene_assets", compiler.attrib
+    assert all(path.parent == shared and path.is_file() for path in resolved_assets(ordinary).values())
+    # The adopted worlds still reference their own unchanged files.
+    assert {name: resolved_assets(target) for name, (_source, target) in variants.items()} == files
+    assert low_crate.read_bytes() == (variants["low"][0] / "scene_assets" / "crate_tex.png").read_bytes()
+    assert not leftovers(directory), leftovers(directory)
+    return {"low": str(variants["low"][1]), "realistic": str(variants["realistic"][1]), "ordinary": str(ordinary),
+            "low_crate": low_crate.name, "realistic_crate": realistic_crate.name}
+
+
 @section
 def door_masks():
     """Doors have their own masks; blank ones follow the fixed masks; the Walkie preset uses 32/121."""
@@ -610,4 +669,5 @@ def door_masks():
 (OUT / "adopt_summary.json").write_text(json.dumps(summary, indent=2, default=str) + "\n")
 if summary["failures"]:
     raise AssertionError("Failed sections: " + ", ".join(summary["failures"]))
+harness.complete(OUT, "adopt", sections=summary["sections"])
 print("ADOPT_FIXTURE_OK", json.dumps({"output": str(OUT), "sections": summary["sections"]}))

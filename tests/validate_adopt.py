@@ -10,9 +10,10 @@ import sys
 import mujoco
 import numpy as np
 
-if len(sys.argv) != 2:
-    raise SystemExit("usage: validate_adopt.py OUTPUT_DIR")
-OUT = Path(sys.argv[1]).resolve()
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import harness  # noqa: E402
+
+OUT, _, _ = harness.completed_output("adopt")
 summary = json.loads((OUT / "adopt_summary.json").read_text())
 assert not summary["failures"], f"the Blender fixture failed: {sorted(summary['failures'])}"
 results = {}
@@ -108,5 +109,15 @@ results["door_masks"] = {"geoms": model.ngeom}
 # Worlds sharing one asset folder both compile with their own files.
 for key in ("first", "second"):
     load(summary["shared_folder_safe_names"][key])
+# Two projects in one shared folder keep their own crate textures.
+shared = summary["shared_folder_two_projects"]
+crates = {}
+for key in ("low", "realistic"):
+    model = load(shared[key])
+    texture = model.texture("crate_tex").id
+    crates[key] = model.tex_data[model.tex_adr[texture]:model.tex_adr[texture] + 3].tolist()
+assert crates["low"][0] > crates["low"][2] and crates["realistic"][2] > crates["realistic"][0], crates
+assert load(shared["ordinary"]).nq == 7
+results["shared_folder_two_projects"] = crates
 
 print("ADOPT_PHYSICS_OK", json.dumps(results))

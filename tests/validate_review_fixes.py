@@ -10,9 +10,10 @@ import sys
 import mujoco
 import numpy as np
 
-if len(sys.argv) != 2:
-    raise SystemExit("usage: validate_review_fixes.py OUTPUT_DIR")
-OUT = Path(sys.argv[1]).resolve()
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import harness  # noqa: E402
+
+OUT, _, _ = harness.completed_output("review_fixes")
 summary = json.loads((OUT / "review_fixes.json").read_text())
 assert not summary["failures"], f"the Blender fixture failed: {sorted(summary['failures'])}"
 LINEAR, SRGB = int(mujoco.mjtColorSpace.mjCOLORSPACE_LINEAR), int(mujoco.mjtColorSpace.mjCOLORSPACE_SRGB)

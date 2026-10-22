@@ -16,19 +16,14 @@ import xml.etree.ElementTree as ET
 
 import bpy
 
-ROOT = Path(__file__).resolve().parents[1]
-sys.path.insert(0, str(ROOT))
-import mujoco_world  # noqa: E402
+sys.dont_write_bytecode = True  # Blender ignores PYTHONDONTWRITEBYTECODE.
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import harness  # noqa: E402
+
+OUT, _ = harness.begin("export_fixes")
 from mujoco_world.exporter import ExportError, export_world  # noqa: E402
 from mujoco_world.project import adopt_mjcf  # noqa: E402
 
-assert Path(mujoco_world.__file__).resolve().is_relative_to(ROOT), mujoco_world.__file__
-mujoco_world.register()
-args = sys.argv[sys.argv.index("--") + 1:] if "--" in sys.argv else []
-if not args:
-    raise SystemExit("Pass an output directory after --")
-OUT = Path(args[0]).resolve()
-OUT.mkdir(parents=True, exist_ok=True)
 summary = {}
 
 
@@ -324,4 +319,5 @@ assert meshes == ["Baked_atlas_authored_mesh"], meshes
 summary["unnamed_atlas"] = str(atlas_path)
 
 (OUT / "export_fixes.json").write_text(json.dumps(summary, indent=2) + "\n")
+harness.complete(OUT, "export_fixes")
 print("EXPORT_FIXES_FIXTURE_OK", json.dumps(summary))

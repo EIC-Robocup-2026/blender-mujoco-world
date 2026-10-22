@@ -1,28 +1,32 @@
 """Blender fixture: hollow compound, nested hinge, live imported edits.
 
-Run Blender --factory-startup --background --python this_file.py -- OUTPUT_DIR.
-Then run validate_compound.py with MuJoCo using the same output directory.
-An optional MJCF/BLEND pair exercises an existing project without saving it.
+Run:
+  blender --background --factory-startup --python-exit-code 1 \
+      --python tests/test_compound_blender.py -- OUTPUT_DIR [MJCF BLEND]
+Then validate the written worlds with MuJoCo:
+  python tests/validate_compound.py OUTPUT_DIR
+
+An optional MJCF/BLEND pair of an existing project is adopted and edited
+too. That project is opened but never saved, and its exports use a shared
+asset folder inside OUTPUT_DIR, so nothing outside OUTPUT_DIR is written.
 """
 import json
 import math
 from pathlib import Path
 import sys
-import tempfile
 
 import bpy
-from mathutils import Vector
 
-ROOT = Path(__file__).resolve().parents[1]
-sys.path.insert(0, str(ROOT))
-import mujoco_world
-from mujoco_world.exporter import export_world
-from mujoco_world.project import adopt_mjcf, group_selected
+sys.dont_write_bytecode = True  # Blender ignores PYTHONDONTWRITEBYTECODE.
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import harness  # noqa: E402
 
-mujoco_world.register()
-args = sys.argv[sys.argv.index("--") + 1:] if "--" in sys.argv else []
-out = Path(args[0] if args else tempfile.mkdtemp(prefix="mjworld-compound-"))
-out.mkdir(parents=True, exist_ok=True)
+out, args = harness.begin("compound", "OUTPUT_DIR [MJCF BLEND]", 1, 3)
+if len(args) == 1:
+    raise SystemExit("Pass both the MJCF and the BLEND file of the existing project, or neither")
+from mujoco_world.exporter import export_world  # noqa: E402
+from mujoco_world.project import adopt_mjcf, group_selected  # noqa: E402
+
 bpy.ops.object.select_all(action="SELECT")
 bpy.ops.object.delete(use_global=False)
 scene = bpy.context.scene
@@ -97,9 +101,12 @@ for old, obj in zip(before, group_parts):
     assert max(abs(old[i][j] - obj.matrix_world[i][j]) for i in range(4) for j in range(4)) < 1e-6
 export_world(bpy.context, str(out / "grouped.xml"))
 
-if len(args) >= 3:
-    bpy.ops.wm.open_mainfile(filepath=args[2])
-    adopt_mjcf(bpy.context, args[1])
+if args:
+    bpy.ops.wm.open_mainfile(filepath=args[1])
+    adopt_mjcf(bpy.context, args[0])
+    # Adoption points the asset folder at the project's own shared folder;
+    # keep every export of this test inside the output directory instead.
+    bpy.context.scene.mujoco_world.asset_directory = str(out / "shared_assets")
     untouched = export_world(bpy.context, str(out / "adopted.xml"))
     # Select one real free body and edit its mass and placement.
     prop = next(o for o in bpy.context.scene.objects if o.type == "EMPTY" and o.mujoco_world.role == "FREE")
@@ -128,4 +135,5 @@ if len(args) >= 3:
     export_world(bpy.context, str(out / "edited.xml"))
     (out / "edits.json").write_text(json.dumps({"body": prop.name, "old_position": old_pos, "mass": prop.mujoco_world.mass, "door": hinge.name, "door_geom": json.loads(surface["mjworld_mjcf_geom"])["name"]}, indent=2))
 
+harness.complete(out, "compound", real_project=bool(args))
 print("COMPOUND_FIXTURE_OK", str(out))

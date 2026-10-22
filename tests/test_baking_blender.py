@@ -1,26 +1,31 @@
-"""Run with Blender --background --factory-startup --python this_file.py.
+"""Blender fixture for the static light bake, its export and source restore.
 
-Writes a portable exported fixture under MJWORLD_BAKE_TEST_OUTPUT, or a temporary
-directory. A separate MuJoCo Python process can compile the printed scene.xml.
+Run:
+  blender --background --factory-startup --python-exit-code 1 \
+      --python tests/test_baking_blender.py -- OUTPUT_DIR
+Then compile the written worlds with MuJoCo:
+  python tests/validate_compile.py bake OUTPUT_DIR
+
+The scene is generated here; the bake, the exported worlds and the saved
+fixture blend file are written to OUTPUT_DIR only.
 """
 
 from array import array
 import json
-import os
 from pathlib import Path
 import sys
-import tempfile
 import xml.etree.ElementTree as ET
 
 import bpy
 
-ROOT = Path(__file__).resolve().parents[1]
-sys.path.insert(0, str(ROOT))
-import mujoco_world
-from mujoco_world.baking import BakeError, bake_static, restore_sources
-from mujoco_world.exporter import export_world
+sys.dont_write_bytecode = True  # Blender ignores PYTHONDONTWRITEBYTECODE.
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import harness  # noqa: E402
 
-mujoco_world.register()
+OUT, _ = harness.begin("bake")
+from mujoco_world.baking import BakeError, bake_static, restore_sources  # noqa: E402
+from mujoco_world.exporter import export_world  # noqa: E402
+
 bpy.ops.object.select_all(action="SELECT")
 bpy.ops.object.delete(use_global=False)
 scene = bpy.context.scene
@@ -94,8 +99,7 @@ source_state = {obj.name: {"mesh": obj.data.as_pointer(), "vertices": [tuple(v.c
                            "materials": [m.as_pointer() for m in obj.data.materials],
                            "matrix": [list(row) for row in obj.matrix_world],
                            "nodes": [len(m.node_tree.nodes) for m in obj.data.materials]} for obj in sources}
-output = Path(os.environ.get("MJWORLD_BAKE_TEST_OUTPUT", tempfile.mkdtemp(prefix="mjworld-bake-test-")))
-output.mkdir(parents=True, exist_ok=True)
+output = OUT
 baseline = export_world(bpy.context, str(output / "baseline" / "scene.xml"))
 baseline_xml = ET.parse(output / "baseline" / "scene.xml")
 baseline_physics = [geom for geom in baseline_xml.findall(".//geom") if geom.get("group") == "3"]
@@ -205,4 +209,5 @@ summary ={"passed": True, "sources": first["source_count"], "excluded_dynamic": 
            "dynamic_reposition_max_difference": max_difference, "master_exr": first["master_exr"],
            "display_png": first["display_png"], "scene_xml": str(output / "scene.xml"), "restored_sources": restored}
 (output / "bake_test_report.json").write_text(json.dumps(summary, indent=2))
+harness.complete(output, "bake")
 print("STATIC_BAKE_TEST_OK", json.dumps(summary))

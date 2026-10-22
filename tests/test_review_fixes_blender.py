@@ -14,7 +14,6 @@ from array import array
 import json
 import os
 from pathlib import Path
-import shutil
 import struct
 import sys
 import traceback
@@ -25,22 +24,17 @@ import zlib
 import addon_utils
 import bpy
 
-ROOT = Path(__file__).resolve().parents[1]
-sys.path.insert(0, str(ROOT))
+sys.dont_write_bytecode = True  # Blender ignores PYTHONDONTWRITEBYTECODE.
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import harness  # noqa: E402
+
+OUT, _ = harness.begin("review_fixes")
 import mujoco_world  # noqa: E402
 from mujoco_world import baking  # noqa: E402
-from mujoco_world.baking import BakeError, bake_covered, bake_static, restore_sources  # noqa: E402
+from mujoco_world.baking import BakeError, bake_covered, bake_leftovers, bake_static, restore_sources  # noqa: E402
 from mujoco_world.exporter import ExportError, export_world, srgb  # noqa: E402
 from mujoco_world.project import adopt_mjcf  # noqa: E402
 
-assert Path(mujoco_world.__file__).resolve().is_relative_to(ROOT), mujoco_world.__file__
-mujoco_world.register()
-args = sys.argv[sys.argv.index("--") + 1:] if "--" in sys.argv else []
-if not args:
-    raise SystemExit("Pass an output directory after --")
-OUT = Path(args[0]).resolve()
-shutil.rmtree(OUT, ignore_errors=True)
-OUT.mkdir(parents=True)
 summary = {"sections": [], "failures": {}, "worlds": {}, "blender": bpy.app.version_string}
 PINNED = {"view_transform": "AgX", "look": "None", "exposure": 0.0, "gamma": 1.0, "display_device": "sRGB"}
 
@@ -318,7 +312,7 @@ def bake_stale_sources():
     """A source that is no longer baked comes back; an uncovered mark keeps its visual."""
     scene = bake_scene()
     box("Floor", (0, 0, -0.05), (1.5, 1.5, 0.05), "VISUAL", material("grey", (0.3, 0.3, 0.3)))
-    a = box("A fixed", (-0.5, 0, 0.3), (0.2, 0.2, 0.2), mat=material("red", (0.8, 0.1, 0.1)))
+    box("A fixed", (-0.5, 0, 0.3), (0.2, 0.2, 0.2), mat=material("red", (0.8, 0.1, 0.1)))
     b = box("B fixed", (0.5, 0, 0.3), (0.2, 0.2, 0.2), mat=material("blue", (0.1, 0.1, 0.8)))
     first = bake_static(bpy.context, str(OUT / "stale_bake"), atlas_size=64, samples=2, margin=1)
     assert first["source_count"] == 3 and first["restored"] == []
@@ -390,6 +384,48 @@ def bake_failure_cleanup():
     assert restore_sources(bpy.context) == 2
     assert "MuJoCo bake piece stray" not in bpy.data.objects
     return {"error": message}
+
+
+@section
+def bake_restore_edges():
+    """'Edit original surfaces': nothing baked, a full round trip, a deleted source, and user data."""
+    scene = bake_scene()
+    box("Floor", (0, 0, -0.05), (1.5, 1.5, 0.05), "VISUAL", material("grey", (0.3, 0.3, 0.3)))
+    kept = box("Kept fixed", (-0.5, 0, 0.3), (0.2, 0.2, 0.2), mat=material("red", (0.8, 0.1, 0.1)))
+    box("Deleted fixed", (0.5, 0, 0.3), (0.2, 0.2, 0.2), mat=material("blue", (0.1, 0.1, 0.8)))
+    before = data_counts()
+    # Nothing baked: the operator is unavailable and the function changes nothing.
+    assert not bpy.ops.mjworld.restore_sources.poll()
+    assert restore_sources(bpy.context) == 0 and data_counts() == before
+    # A bake and a restore leave exactly the data that was there before; the
+    # lightmap files stay on disk.
+    first = bake_static(bpy.context, str(OUT / "restore_edges"), atlas_size=64, samples=2, margin=1)
+    assert restore_sources(bpy.context) == 3
+    after = data_counts()
+    assert after == before, {kind: sorted(set(after[kind]) ^ set(before[kind])) for kind in after}
+    assert Path(first["master_exr"]).is_file() and Path(first["display_png"]).is_file()
+    # A source deleted after baking, and a user object placed in the bake's
+    # collection that uses the baked material: the rest is restored, the
+    # user's object, collection and material survive.
+    second = bake_static(bpy.context, str(OUT / "restore_edges"), atlas_size=64, samples=2, margin=1)
+    atlas = bpy.data.objects[second["object"]]
+    baked_material = atlas.data.materials[0]
+    material_name, collection_name = baked_material.name, atlas.users_collection[0].name
+    bpy.ops.mesh.primitive_cube_add(size=0.2, location=(0, 1, 0.3))
+    user = bpy.context.object
+    user.name = "User prop"
+    for owner in list(user.users_collection):
+        owner.objects.unlink(user)
+    bpy.data.collections[collection_name].objects.link(user)
+    user.data.materials.append(baked_material)
+    bpy.data.objects.remove(bpy.data.objects["Deleted fixed"])
+    assert restore_sources(bpy.context) == 2
+    assert kept.visible_get() and not kept.hide_render
+    assert not any(key.startswith("mjworld_bake") for key in kept.keys()), list(kept.keys())
+    assert second["object"] not in bpy.data.objects and not bake_leftovers(scene)
+    assert "User prop" in bpy.data.collections[collection_name].objects
+    assert material_name in bpy.data.materials and user.data.materials[0].name == material_name
+    return {"first_sources": first["source_count"], "second_sources": second["source_count"]}
 
 
 @section
@@ -804,4 +840,5 @@ def operators():
 (OUT / "review_fixes.json").write_text(json.dumps(summary, indent=2, default=str) + "\n")
 if summary["failures"]:
     raise AssertionError("Failed sections: " + ", ".join(summary["failures"]))
+harness.complete(OUT, "review_fixes", sections=summary["sections"])
 print("REVIEW_FIXES_OK", json.dumps({"output": str(OUT), "sections": summary["sections"]}))

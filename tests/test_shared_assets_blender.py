@@ -1,8 +1,15 @@
-"""Export both existing room variants twice into one shared portable asset folder.
+"""Export both variants of an existing room twice into one shared asset folder.
 
-Blender --background --factory-startup --python this_file.py -- ROOM_ROOT OUTPUT
-The room root supplies scene.xml/chula_pat14_6.blend and realistic equivalents.
-Source projects are opened read-only; no blend file is saved.
+Run:
+  blender --background --factory-startup --python-exit-code 1 \
+      --python tests/test_shared_assets_blender.py -- OUTPUT_DIR ROOM_ROOT
+Then compile the written worlds with MuJoCo:
+  python tests/validate_compile.py shared_assets OUTPUT_DIR
+
+ROOM_ROOT is a room project with scene.xml and chula_pat14_6.blend, and
+realistic/scene.xml and realistic/realistic.blend; the test expects its
+task_apple_1_00 object. Pass a copy of the project: its blend files are
+opened but never saved, and every export goes to OUTPUT_DIR.
 """
 import json
 import hashlib
@@ -12,14 +19,15 @@ import xml.etree.ElementTree as ET
 
 import bpy
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-import mujoco_world
-from mujoco_world.exporter import _export_simple, export_world
-from mujoco_world.project import adopt_mjcf
+sys.dont_write_bytecode = True  # Blender ignores PYTHONDONTWRITEBYTECODE.
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import harness  # noqa: E402
 
-mujoco_world.register()
-args = sys.argv[sys.argv.index("--") + 1:]
-room, output = (Path(value).resolve() for value in args)
+output, args = harness.begin("shared_assets", "OUTPUT_DIR ROOM_ROOT", 2, 2)
+from mujoco_world.exporter import _export_simple, export_world  # noqa: E402
+from mujoco_world.project import adopt_mjcf  # noqa: E402
+
+room = Path(args[0]).resolve()
 shared = output / "scene_assets"
 variants = [(room / "chula_pat14_6.blend", room / "scene.xml", output / "scene.xml"),
             (room / "realistic/realistic.blend", room / "realistic/scene.xml", output / "realistic/scene.xml")]
@@ -150,6 +158,7 @@ for untouched, edited in ((variants[0], variants[1]), (variants[1], variants[0])
     assert mesh_file(edited[2], "task_apple_1_00") == "task_apple_1_00_authored_mesh.obj"
     assert referenced(untouched[2]) == before
     cross_variant[untouched[2].parent.name] = edited_apple
+harness.complete(output, "shared_assets")
 print("SHARED_ASSETS_TEST_OK", json.dumps({"output": str(output), "files_after_each_pair": counts,
                                            "cross_variant_content_named": cross_variant,
                                            "scenes": [str(v[2]) for v in variants] + [str(generic), str(generic_red), str(generic_blue)]}))
