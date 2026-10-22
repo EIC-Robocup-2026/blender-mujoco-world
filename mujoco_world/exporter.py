@@ -20,6 +20,12 @@ class ExportError(ValueError):
     pass
 
 
+def addon_version():
+    """The add-on version from bl_info, as written into every export report."""
+    from . import bl_info
+    return ".".join(str(part) for part in bl_info["version"])
+
+
 def numbers(values):
     return " ".join(f"{float(v):.9g}" for v in values)
 
@@ -545,9 +551,15 @@ class AssetWriter:
 
     A per-XML folder belongs to one world. Its files are staged and replace the
     previous export's files only in commit(), so a failed export leaves the
-    previous output intact. Only files this export writes are ever removed,
-    never a protected source file.
+    previous output intact. The folder's manifest (MANIFEST) lists the files
+    the last export wrote; commit() removes those the new export no longer
+    writes, so renamed or deleted objects leave no stale files. Only files a
+    manifest lists or this export wrote are ever removed, never a protected
+    source file. A shared folder has no manifest: other worlds may still use
+    any of its files.
     """
+
+    MANIFEST = ".mujoco_world_manifest.json"
 
     def __init__(self, directory, shared):
         self.directory = Path(directory)
@@ -557,6 +569,17 @@ class AssetWriter:
         self._remove = set()
         self._protected = set()
         self._stage = None
+        self._previous = set() if shared else self._read_manifest()
+
+    def _read_manifest(self):
+        """Files the previous export into this per-XML folder wrote."""
+        try:
+            names = json.loads((self.directory / self.MANIFEST).read_text(encoding="utf-8")).get("files", [])
+        except (OSError, ValueError, AttributeError):
+            return set()
+        # Only plain file names directly inside the folder; anything else is ignored.
+        return {(self.directory / name).resolve() for name in names
+                if isinstance(name, str) and name and name == Path(name).name and not name.startswith(".")}
 
     def protect(self, path):
         """Never remove ``path`` (an adopted world's own source asset)."""
@@ -615,13 +638,22 @@ class AssetWriter:
         self._remove.add(path)
 
     def commit(self):
-        """Move staged files into place and remove discarded ones."""
+        """Move staged files into place, remove discarded and stale ones, and record the manifest."""
         for target, staged in self._staged.items():
             os.replace(staged, target)
         self._staged.clear()
-        for path in self._remove - self._protected:
+        stale = set() if self.shared else self._previous - self.written
+        for path in (self._remove | stale) - self._protected:
             path.unlink(missing_ok=True)
         self._remove.clear()
+        manifest = self.directory / self.MANIFEST
+        if self.shared:
+            # A folder that became shared no longer belongs to one world.
+            manifest.unlink(missing_ok=True)
+            return
+        files = sorted(path.name for path in self.written if path.parent == self.directory.resolve())
+        _replace_file(manifest, lambda target: target.write_text(json.dumps({"files": files}, indent=1) + "\n", encoding="utf-8"))
+        self._previous = set(self.written)
 
     def close(self):
         if self._stage is not None:
@@ -670,6 +702,36 @@ def role_masks(settings, role):
             return mask_value(settings, "hinge_" + kind)
         return mask_value(settings, "object_" + kind)
     return pick("contype"), pick("conaffinity")
+
+
+def dropped_object_notes(context, candidates):
+    """Notes for visible objects whose geometry the exporters cannot translate.
+
+    Curves, surfaces, text and metaballs need converting to mesh first.
+    Instancers (collection, vertex or face instancing, particles) and Geometry
+    Nodes instances are not realized: only a host mesh's own geometry exports.
+    The exporters call this for both ordinary and adopted worlds; it only adds
+    report notes.
+    """
+    from .project import _included
+    shown = [obj for obj in candidates if obj.visible_get(view_layer=context.view_layer) and not obj.hide_render and _included(obj)]
+    notes = []
+    for obj in shown:
+        if obj.type in {"CURVE", "SURFACE", "FONT", "META"}:
+            notes.append(f"{obj.name}: convert this {obj.type.lower()} to mesh before exporting; it was left out.")
+        if obj.is_instancer:
+            notes.append(f"{obj.name}: instances are not exported. Realize instances / Make Instances Real before exporting.")
+    hosts = {obj for obj in shown if not obj.is_instancer}
+    reported = set()
+    for instance in context.evaluated_depsgraph_get().object_instances:
+        if not instance.is_instance or instance.parent is None:
+            continue
+        host = instance.parent.original
+        if host in hosts and host not in reported:
+            reported.add(host)
+            notes.append(f"{host.name}: its Geometry Nodes instances are not exported, only its own mesh. "
+                         "Add a Realize Instances node before exporting.")
+    return notes
 
 
 def skip_faceless(context, objects):
@@ -760,17 +822,11 @@ def _export_simple(context, filepath, *, regroup=False):
 def _build_simple(context, filepath, objects, labels, candidates, unit, plane_mask, masks, assets, asset_prefix, notes=()):
     """Build the ordinary world in memory; asset files go through ``assets``."""
     from .baking import bake_covered
-    from .project import _included
     scene = context.scene
     settings = scene.mujoco_world
     warnings = list(notes)
     covered = bake_covered(scene)
-    for candidate in candidates:
-        if candidate.visible_get(view_layer=context.view_layer) and not candidate.hide_render and _included(candidate):
-            if candidate.type in {"CURVE", "SURFACE", "FONT", "META"}:
-                warnings.append(f"{candidate.name}: convert this {candidate.type.lower()} to mesh before exporting; it was left out.")
-            if candidate.is_instancer:
-                warnings.append(f"{candidate.name}: instances are not exported. Realize instances / Make Instances Real before exporting.")
+    warnings.extend(dropped_object_notes(context, candidates))
     root = ET.Element("mujoco", model=slug(filepath.stem))
     # Radians match robot models such as Walkie, which merge this world and
     # require one angle convention. Inertia settings stay at MuJoCo defaults:
@@ -915,7 +971,7 @@ def _build_simple(context, filepath, objects, labels, candidates, unit, plane_ma
     extent = max(1.0, *(max(v[i] for v in all_world_vertices) - min(v[i] for v in all_world_vertices) for i in range(3)))
     ET.SubElement(root, "statistic", center=numbers(midpoint), extent=f"{extent:.9g}")
     warnings = list(dict.fromkeys(warnings))
-    report = {"addon_version": "0.1.0", "blender_version": bpy.app.version_string, "file": filepath.name,
+    report = {"addon_version": addon_version(), "blender_version": bpy.app.version_string, "file": filepath.name,
               "objects": len(objects), "meshes": sum(1 for x in asset if x.tag == "mesh"), "textures": len(exported_images),
               "triangles": sum(x["triangles"] for x in report_objects), "metres_per_blender_unit": unit,
               "plane": {"enabled": settings.plane, "height_m": property_value(settings.plane_height),
