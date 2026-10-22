@@ -4,9 +4,11 @@
 Usage:
   python3 package_addon.py [--output DIRECTORY]
 
-The archive holds every file of mujoco_world/ (without bytecode caches or
-hidden files) plus README.md and LICENSE, all under mujoco_world/, which is
-the layout Blender's "Install from Disk" expects for a legacy add-on.
+The archive holds the add-on's Python modules (every .py file of
+mujoco_world/) plus README.md and LICENSE, all under mujoco_world/, which is
+the layout Blender's "Install from Disk" expects for a legacy add-on. Any
+other file in mujoco_world/, hidden files and bytecode caches aside, stops
+the build, so an editor backup, a scratch export or a stray asset never ships.
 
 VERSION is read from bl_info in mujoco_world/__init__.py, so the add-on's
 version has a single source. The build is reproducible: entries are sorted
@@ -51,15 +53,27 @@ def entry_time():
 
 
 def package_files():
-    """(archive name, source path) of every packaged file, sorted by archive name."""
-    files = []
-    for path in (ROOT / PACKAGE).rglob("*"):
+    """(archive name, source path) of every packaged file, sorted by archive name.
+
+    Only regular .py files of the package and EXTRA_FILES are packaged; any
+    other file in the package (a symbolic link included) is refused.
+    """
+    files, unexpected = [], []
+    for path in sorted((ROOT / PACKAGE).rglob("*")):
         relative = path.relative_to(ROOT / PACKAGE)
-        if not path.is_file() or path.suffix in EXCLUDED_SUFFIXES:
-            continue
         if any(part in EXCLUDED_DIRECTORIES or part.startswith(".") for part in relative.parts):
             continue
+        if path.is_dir() and not path.is_symlink():
+            continue
+        if path.suffix in EXCLUDED_SUFFIXES and not path.is_symlink():
+            continue
+        if path.suffix != ".py" or path.is_symlink() or not path.is_file():
+            unexpected.append(relative.as_posix())
+            continue
         files.append((f"{PACKAGE}/{relative.as_posix()}", path))
+    if unexpected:
+        raise SystemExit(f"{PACKAGE}/ holds files that are not add-on modules: {', '.join(unexpected)}. "
+                         "Move them out of the package, then build again.")
     for name in EXTRA_FILES:
         files.append((f"{PACKAGE}/{name}", ROOT / name))
     names = [name for name, _ in files]
