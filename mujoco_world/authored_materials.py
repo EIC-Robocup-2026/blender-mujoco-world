@@ -46,7 +46,7 @@ def update_authored_materials(scene, root, assets, asset_prefix, geoms):
     material.
     """
     from .baking import bake_covered
-    from .exporter import _write_image, image_problem, numbers, property_numbers, slug, srgb, texture_colorspace
+    from .exporter import _write_image, image_problem, numbers, profile_text, property_numbers, slug, srgb, texture_colorspace
     asset = root.find("asset")
     if asset is None:
         asset = ET.SubElement(root, "asset")
@@ -88,6 +88,10 @@ def update_authored_materials(scene, root, assets, asset_prefix, geoms):
                 written = {}
                 filename = assets.write(label + ".png", lambda target: written.update(
                     _write_image(image, target, baked=baked, scene=scene, where=obj.name)))
+                if written["hdr"]:
+                    warnings.append(f"{obj.name}: HDR bake '{image.name}' converted to display PNG using "
+                                    f"{profile_text(written['profile'])}. Keep that view transform consistent when "
+                                    "comparing Blender and MuJoCo.")
                 warnings.extend(f"{obj.name}: {note}" for note in written["notes"])
                 ET.SubElement(asset, "texture", name=label + "_texture", type="2d",
                               file=asset_prefix + "/" + filename,

@@ -701,19 +701,23 @@ def _append_new_parts(context, objects, root, world, asset, assets, make_body, w
     if not objects:
         return []
     scene = context.scene
-    selected, active = list(context.selected_objects), context.view_layer.objects.active
-    only = scene.mujoco_world.selected_only
     asset_directory = scene.mujoco_world.asset_directory
     try:
-        bpy.ops.object.select_all(action="DESELECT")
-        for obj in objects:
-            obj.select_set(True)
-        scene.mujoco_world.selected_only = True
         scene.mujoco_world.asset_directory = ""
         with tempfile.TemporaryDirectory(prefix="mjworld-parts-") as temporary:
             path = Path(temporary) / "parts.xml"
-            report = _export_simple(context, str(path))
+            # An explicit object list also reaches hidden bake sources, which no selection holds.
+            report = _export_simple(context, str(path), candidates=objects)
             parts_root = ET.parse(path).getroot()
+            details = report["object_details"]
+            groups = {}
+            for detail in details:
+                obj = scene.objects.get(detail["source"])
+                owner = body_owner(obj)
+                groups.setdefault(owner, []).append((obj, detail))
+            exported = {body.get("name"): body for body in parts_root.find("worldbody").findall("body")}
+            # Checked before any file is copied, so a refused export adds nothing to a shared folder.
+            _check_part_names(world, groups, exported)
             names = {element.get("name") for element in asset}
             rename = {}
             for element in parts_root.find("asset"):
@@ -732,13 +736,6 @@ def _append_new_parts(context, objects, root, world, asset, assets, make_body, w
                     original = Path(temporary) / "parts_assets" / element.get("file")
                     element.set("file", asset_prefix + "/" + assets.copy(original, slug(rename[old_name]) + original.suffix))
                 asset.append(element)
-            details = report["object_details"]
-            groups = {}
-            for detail in details:
-                obj = scene.objects.get(detail["source"])
-                owner = body_owner(obj)
-                groups.setdefault(owner, []).append((obj, detail))
-            exported = {body.get("name"): body for body in parts_root.find("worldbody").findall("body")}
             for owner, members in groups.items():
                 target = make_body(owner) if owner else world
                 if owner:
@@ -773,11 +770,39 @@ def _append_new_parts(context, objects, root, world, asset, assets, make_body, w
             return details
     finally:
         scene.mujoco_world.asset_directory = asset_directory
-        scene.mujoco_world.selected_only = only
-        bpy.ops.object.select_all(action="DESELECT")
-        for obj in selected:
-            obj.select_set(True)
-        context.view_layer.objects.active = active
+
+
+# MuJoCo name namespaces of the elements new parts add; a joint and a free joint share one.
+_NAME_KINDS = {"body": "body", "geom": "geom", "joint": "joint", "freejoint": "joint", "site": "site"}
+
+
+def _check_part_names(world, groups, exported):
+    """Refuse new parts whose body, geom, joint or site names the adopted world already uses.
+
+    ``groups`` maps each owner body (None for top-level parts) to its
+    ``(object, detail)`` pairs, and ``exported`` the part export's bodies by
+    name. A grouped part contributes only its geoms to the owner's body.
+    MuJoCo rejects a repeated name, so the export names the objects instead.
+    """
+    from .exporter import ExportError
+    taken = {kind: set() for kind in _NAME_KINDS.values()}
+    for element in world.iter():
+        if element.tag in _NAME_KINDS and element.get("name"):
+            taken[_NAME_KINDS[element.tag]].add(element.get("name"))
+    clashes = []
+    for owner, members in groups.items():
+        for obj, detail in members:
+            body = exported[detail["body"]]
+            for element in (body.findall("geom") if owner else body.iter()):
+                kind, name = _NAME_KINDS.get(element.tag), element.get("name")
+                if kind is None or not name:
+                    continue
+                if name in taken[kind]:
+                    clashes.append(f"'{obj.name}' ({element.tag} '{name}')")
+                taken[kind].add(name)
+    if clashes:
+        raise ExportError("New objects would repeat names the adopted world already uses, which MuJoCo rejects: "
+                          + ", ".join(clashes) + ". Rename these objects, then export again.")
 
 
 def _primitive_size(obj, attrs, resolved=None):
@@ -1030,7 +1055,7 @@ def export_adopted(context, filepath):
     previous ones only at the end, so a failed export keeps the last good one.
     """
     from .baking import bake_covered
-    from .exporter import (AssetWriter, ExportError, _asset_paths, dropped_object_notes, skip_faceless, write_text, write_xml,
+    from .exporter import (AssetWriter, ExportError, _asset_paths, dropped_object_notes, publish, skip_faceless, xml_bytes,
                            xml_path)
     if context.mode != "OBJECT":
         raise ExportError("Switch to Object Mode before exporting.")
@@ -1042,7 +1067,8 @@ def export_adopted(context, filepath):
     unit = float(scene.unit_settings.scale_length)
     if unit <= 0:
         raise ExportError("Scene unit scale must be positive.")
-    objects = sorted({o for o in scene.objects if o.type == "MESH" and not o.get("mjworld_adopted_exclude") and not o.get("mjworld_bake_clone") and _included(o) and (o.get("mjworld_mjcf_geom") or o.get("mjworld_baked_atlas") or (o.visible_get() and not o.hide_render))}, key=lambda o: o.name)
+    # Hidden bake sources still export their colliders, as in an ordinary export.
+    objects = sorted({o for o in scene.objects if o.type == "MESH" and not o.get("mjworld_adopted_exclude") and not o.get("mjworld_bake_clone") and _included(o) and (o.get("mjworld_mjcf_geom") or o.get("mjworld_baked_atlas") or o.get("mjworld_bake_source") or (o.visible_get() and not o.hide_render))}, key=lambda o: o.name)
     # Adopted mesh geoms keep their physics, so only new meshes may be skipped.
     new, faceless_notes = skip_faceless(context, [o for o in objects if not o.get("mjworld_mjcf_geom")])
     objects = [o for o in objects if o.get("mjworld_mjcf_geom") or o in new]
@@ -1079,9 +1105,8 @@ def export_adopted(context, filepath):
     try:
         report = _build_adopted(context, path, root, compiler, asset, source, directories, objects,
                                 adopted_bodies, fresh, unique, chains, unit, assets, asset_prefix, warnings, covered)
-        assets.commit()
-        write_xml(root, path)
-        write_text(path.parent / "export_report.json", json.dumps(report, indent=2) + "\n")
+        publish(assets, [(path, xml_bytes(root)),
+                         (path.parent / "export_report.json", (json.dumps(report, indent=2) + "\n").encode("utf-8"))])
     finally:
         assets.close()
     return report
@@ -1096,7 +1121,8 @@ def _build_adopted(context, path, root, compiler, asset, source, directories, ob
     bake sources whose appearance an atlas provides.
     """
     from .exporter import (ExportError, _extract_geometry, _write_obj, _write_image, addon_version, check_door, image_problem,
-                           numbers, inspect_material, profile_text, property_numbers, property_value, slug, texture_colorspace)
+                           numbers, inspect_material, profile_text, property_numbers, property_value, slug, texture_colorspace,
+                           uncovered_bake_source)
     scene = context.scene
     settings = scene.mujoco_world
     # Preserve original material/solver/default declarations. Asset files are
@@ -1316,6 +1342,9 @@ def _build_adopted(context, path, root, compiler, asset, source, directories, ob
                     joint.set("ref", numbers([start]))
                     axis = Vector(tuple(float(v) for v in joint.get("axis", "0 0 1").split()))
                     delta = math.radians(cfg.hinge_start - baseline["hinge_start"])
+                    # MuJoCo accepts one orientation per body; the quaternion replaces the source's.
+                    for field in ("euler", "axisangle", "xyaxes", "zaxis"):
+                        body.attrib.pop(field, None)
                     body.set("quat", numbers(transform.to_quaternion() @ Quaternion(axis, delta)))
         bodies[obj] = body
         return body
@@ -1342,6 +1371,8 @@ def _build_adopted(context, path, root, compiler, asset, source, directories, ob
             attrs = dict(attrs)
             if baked_source and obj.mujoco_world.role == "VISUAL":
                 continue
+            if obj.get("mjworld_bake_source") and not baked_source and obj.mujoco_world.role != "COLLIDER":
+                warnings.append(uncovered_bake_source(obj))
             source_name = attrs.get("name")
             if obj in fresh:
                 warnings.append(f"{obj.name}: copy of adopted geom '{attrs.get('name')}', exported as geom '{fresh[obj]}'.")
@@ -1442,9 +1473,15 @@ def _build_adopted(context, path, root, compiler, asset, source, directories, ob
         else:
             # New static visual atlas: material comes from the current packed
             # HDR image, converted through the scene's current view transform.
+            # New bake sources that also collide keep their colliders through
+            # the ordinary exporter, which leaves out a covered visual.
             if obj.mujoco_world.role != "VISUAL":
                 new_parts.append(obj)
                 continue
+            if baked_source:
+                continue
+            if obj.get("mjworld_bake_source"):
+                warnings.append(uncovered_bake_source(obj))
             geometry = _extract_geometry(obj, depsgraph, unit)
             mat = obj.material_slots[0].material if obj.material_slots else None
             info = inspect_material(mat)
@@ -1462,7 +1499,7 @@ def _build_adopted(context, path, root, compiler, asset, source, directories, ob
                     _write_image(image, target_path, baked=True, scene=scene, where=obj.name)))
                 ET.SubElement(asset, "texture", name=label + "_texture", type="2d", file=asset_prefix + "/" + image_file,
                               colorspace=texture_colorspace(settings, written["linear"]))
-                if written["profile"]:
+                if written["hdr"]:
                     warnings.append(f"{obj.name}: HDR bake '{image.name}' converted to display PNG using {profile_text(written['profile'])}.")
                 warnings.extend(f"{obj.name}: {note}" for note in written["notes"])
                 material_args.update(texture=label + "_texture", rgba="1 1 1 1", texuniform="false")
@@ -1496,18 +1533,24 @@ def _build_adopted(context, path, root, compiler, asset, source, directories, ob
     # material references, so gather references across the entire XML tree.
     mesh_refs = {element.get("mesh") for element in root.iter() if element.get("mesh")}
     material_refs = {element.get("material") for element in root.iter() if element.get("material")}
+    removed = []
     for element in list(asset):
         if (element.tag == "mesh" and element.get("name") not in mesh_refs) or (element.tag == "material" and element.get("name") not in material_refs):
             asset.remove(element)
-            if element.get("file"):
-                assets.discard(path.parent / element.get("file"))
-    texture_refs = {element.get("texture") for element in asset if element.get("texture")}
+            removed.append(element)
+    # Gathered once the unused materials are gone, so their textures go too;
+    # material layers and defaults name textures as well.
+    texture_refs = {element.get("texture") for element in root.iter() if element.get("texture")}
     for element in list(asset.findall("texture")):
         if element.get("name") not in texture_refs and element.get("type") != "skybox":
             asset.remove(element)
-            for field in _FILE_FIELDS:
-                if element.get(field):
-                    assets.discard(path.parent / element.get(field))
+            removed.append(element)
+    # Assets can share one file, so a file is dropped only when nothing left names it.
+    kept_files = {element.get(field) for element in root.iter() for field in _FILE_FIELDS if element.get(field)}
+    for element in removed:
+        for field in _FILE_FIELDS:
+            if element.get(field) and element.get(field) not in kept_files:
+                assets.discard(path.parent / element.get(field))
     return {"addon_version": addon_version(), "blender_version": bpy.app.version_string, "file": path.name, "objects": len(details), "bodies": len(bodies), "meshes": len(asset.findall("mesh")), "textures": len(asset.findall("texture")), "triangles": sum(len(o.data.polygons) for o in objects), "adopted_physics": True, "metres_per_blender_unit": unit, "object_details": details, "warnings": list(dict.fromkeys(warnings)), "plane": {"enabled": True, "name": "floor", "count": plane_count}}
 
 

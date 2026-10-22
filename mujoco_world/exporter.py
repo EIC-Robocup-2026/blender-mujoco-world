@@ -399,16 +399,21 @@ def _copy_png(image, path):
 
 def _encode_image(image, path, baked, scene):
     if image.is_float:
+        # 16-bit PNGs load as float buffers. An unchanged sRGB one is copied,
+        # also when it holds lighting: its values are display values already,
+        # and MuJoCo reads 16-bit PNGs as 8-bit. A lightmap this add-on baked
+        # records its display profile and is always converted with it.
+        data = None
+        if not _linear_colorspace(image) and not (baked and image.get("mjworld_display_view_transform")):
+            data = _unmodified_png(image)
+        if data is not None:
+            path.write_bytes(data)
+            return {"profile": None, "linear": False, "hdr": False, "notes": []}
         if baked:
             # save_render applies the display profile to the HDR bake; plain
             # save() would silently clip radiance above one.
-            return {"profile": save_image(image, path, profile=display_profile(image, scene)), "linear": False, "notes": []}
-        # 16-bit PNGs load as float buffers. An unchanged sRGB one is copied;
-        # MuJoCo reads 16-bit PNGs as 8-bit.
-        data = None if _linear_colorspace(image) else _unmodified_png(image)
-        if data is not None:
-            path.write_bytes(data)
-            return {"profile": None, "linear": False, "notes": []}
+            return {"profile": save_image(image, path, profile=display_profile(image, scene)), "linear": False,
+                    "hdr": True, "notes": []}
         rgba = _rgba_pixels(image)
         clipped = bool((rgba[:, :3] > 1.0).any())
         _save_png_pixels(image, path, _encode_srgb(rgba))
@@ -416,27 +421,29 @@ def _encode_image(image, path, baked, scene):
         if clipped:
             note += ("; values above 1 were clipped. If it is a light bake, enable "
                      "'Image already contains lighting' to convert it with a view transform")
-        return {"profile": dict(STANDARD_PROFILE, display_device="sRGB"), "linear": False, "notes": [note]}
+        return {"profile": dict(STANDARD_PROFILE, display_device="sRGB"), "linear": False, "hdr": False, "notes": [note]}
     if not _linear_colorspace(image):
         _copy_png(image, path)
-        return {"profile": None, "linear": False, "notes": []}
+        return {"profile": None, "linear": False, "hdr": False, "notes": []}
     notes = [f"image '{image.name}' is tagged {image.colorspace_settings.name}, so its values are linear; "
              "use the sRGB colour space for colour textures"]
     if scene.mujoco_world.texture_mode == "DISPLAY":
         # Display PNG values: encode what Blender shows as linear colour.
         _save_png_pixels(image, path, _encode_srgb(_rgba_pixels(image)))
-        return {"profile": None, "linear": False, "notes": notes}
+        return {"profile": None, "linear": False, "hdr": False, "notes": notes}
     _copy_png(image, path)
-    return {"profile": None, "linear": True, "notes": notes}
+    return {"profile": None, "linear": True, "hdr": False, "notes": notes}
 
 
 def _write_image(image, path, *, baked=False, scene, where=None):
     """Write ``image`` to the PNG ``path`` and describe the result.
 
-    Returns ``{"profile", "linear", "notes"}``: the colour profile a float
-    image was converted with (None otherwise), whether the PNG holds linear
-    values (a linear byte image in sRGB texture mode; tag its texture with
-    texture_colorspace()), and notes for the report. Errors name the original
+    Returns ``{"profile", "linear", "hdr", "notes"}``: the colour profile a
+    float image was converted with (None otherwise), whether the PNG holds
+    linear values (a linear byte image in sRGB texture mode; tag its texture
+    with texture_colorspace()), whether an HDR light bake was converted to
+    display values with the profile (worth a warning: the view transform must
+    stay consistent), and notes for the report. Errors name the original
     image, after ``where`` (object and material).
     """
     try:
@@ -537,8 +544,13 @@ def _asset_paths(scene, filepath):
 
 def _content_name(path, data):
     """Content-addressed file name for ``path`` in the same folder."""
+    return _digest_name(path, hashlib.sha256(data).hexdigest())
+
+
+def _digest_name(path, digest):
+    """Content-addressed file name for ``path`` whose content has the SHA-256 hex ``digest``."""
     label = "texture" if path.suffix.lower() == ".png" else "mesh"
-    return label + "_" + hashlib.sha256(data).hexdigest()[:24] + path.suffix.lower()
+    return label + "_" + digest[:24] + path.suffix.lower()
 
 
 def file_digest(path):
@@ -574,13 +586,26 @@ class AssetWriter:
     A per-XML folder belongs to one world. Its files are staged and replace the
     previous export's files only in commit(), so a failed export leaves the
     previous output intact. The folder's manifest (MANIFEST) records the name
-    and SHA-256 digest of every file the last export wrote; commit() removes
-    those the new export no longer writes, so renamed or deleted objects leave
-    no stale files. A stale file is removed only when it is a regular file
-    directly in the folder whose content still matches its recorded digest:
-    files the manifest does not list, files edited since, symbolic links (and
-    whatever they point to) and protected source files are kept. A shared
-    folder has no manifest: other worlds may still use any of its files.
+    and SHA-256 digest of every file the last export wrote; finish(), called
+    once the new XML is in place, removes those the new export no longer
+    writes, so renamed or deleted objects leave no stale files. A stale file is
+    removed only when it is a regular file directly in the folder whose content
+    still matches its recorded digest: files the manifest does not list, files
+    edited since, symbolic links (and whatever they point to) and protected
+    source files are kept. A shared folder has no manifest: other worlds may
+    still use any of its files.
+
+    A per-XML export replaces only the files its folder's manifest lists (and
+    creates absent ones). Any other existing file is not this world's: another
+    world may use the folder as its shared asset folder, an older add-on
+    version wrote it, or it is an adopted world's own source file. It is
+    referenced as it is when its content is identical, and different content
+    gets a content-addressed name beside it instead.
+
+    Within one export a name holds one content. A second file written under a
+    name the export already used for other content (a texture and a height
+    field of the same name, say) gets a content-addressed name; identical
+    content shares the name.
     """
 
     MANIFEST = ".mujoco_world_manifest.json"
@@ -590,8 +615,10 @@ class AssetWriter:
         self.shared = shared
         self.written = set()
         self._staged = {}
+        self._used = {}
         self._protected = set()
         self._stage = None
+        self._count = 0
         self._previous = {} if shared else self._read_manifest()
 
     def _entry(self, path):
@@ -650,21 +677,62 @@ class AssetWriter:
         """Write one asset with ``writer(path)``; return the file name to reference."""
         target = self.directory / filename
         if not self.shared:
-            staged = self._staging() / filename
+            # One folder per file, so two files of one name never overwrite each other here.
+            self._count += 1
+            staged = self._staging() / str(self._count) / filename
+            staged.parent.mkdir()
             writer(staged)
-            self._staged[target] = staged
-            self.written.add(target)
-            return filename
+            digest = file_digest(staged)
+            if self._settle(target, staged, digest):
+                return filename
+            final = target.parent / _digest_name(target, digest)
+            if self._settle(final, staged, digest):
+                return final.name
+            raise ExportError(f"The asset folder {self.directory} already has '{final.name}' with other content, which this "
+                              "world's last export did not write, so the export does not replace it. Remove or rename that "
+                              "file, then export again.")
         with tempfile.TemporaryDirectory(prefix=".mjworld-", dir=self.directory) as temporary:
             working = Path(temporary) / filename
             writer(working)
             return self._place(target, working, content_named=content_named, move=True)
 
+    def _settle(self, target, staged, digest):
+        """Use the per-XML name ``target`` for the staged file with SHA-256 ``digest``; return whether it can.
+
+        The name can hold the file when this export has not used it for other
+        content and it is free: absent, or listed in the previous manifest and
+        not an adopted world's source file. An existing file that is not this
+        world's is referenced as it is when its content is identical.
+        """
+        used = self._used.get(target)
+        if used is not None:
+            return used == digest
+        if not os.path.lexists(target) or (target.name in self._previous and target not in self._protected):
+            self._staged[target] = staged
+            self.written.add(target)
+        elif not self._identical(target, digest):
+            return False
+        self._used[target] = digest
+        return True
+
+    @staticmethod
+    def _identical(path, digest):
+        """Whether ``path`` is a regular file (not a link) whose content has SHA-256 ``digest``."""
+        try:
+            return not path.is_symlink() and path.is_file() and file_digest(path) == digest
+        except OSError:
+            return False
+
     def copy(self, source, filename):
         """Copy an existing asset file; return the file name to reference."""
         target = self.directory / filename
         if Path(source).resolve() == target.resolve():
-            return filename
+            # The source already is the asset file (an export into the adopted world's own folder).
+            if self.shared:
+                return filename
+            digest = file_digest(source)
+            if self._used.setdefault(target, digest) == digest:
+                return filename
         if not self.shared:
             return self.write(filename, lambda path: shutil.copyfile(source, path))
         return self._place(target, Path(source), content_named=False, move=False)
@@ -678,6 +746,7 @@ class AssetWriter:
         if self.shared or path not in self.written or path in self._protected:
             return
         self._staged.pop(path, None)
+        self._used.pop(path, None)
         self.written.discard(path)
 
     def _stale(self, name, digest):
@@ -694,28 +763,42 @@ class AssetWriter:
         except OSError:
             return None
 
+    def _record(self, digests):
+        """Write the manifest for ``digests`` (file name to SHA-256, or None when unknown)."""
+        record = {"files": sorted(digests), "sha256": {name: digests[name] for name in sorted(digests) if digests[name]}}
+        _replace_file(self.directory / self.MANIFEST,
+                      lambda target: target.write_text(json.dumps(record, indent=1) + "\n", encoding="utf-8"))
+
     def commit(self):
-        """Move staged files into place, remove stale ones, and record the manifest."""
-        digests = {}
+        """Move the staged files into place, before the XML that references them.
+
+        A per-XML folder's manifest first lists the new files beside the
+        previous ones, so a file placed here stays this world's even when the
+        XML is not replaced afterwards. Nothing is removed until finish().
+        """
+        if self.shared:
+            # A folder that became shared no longer belongs to one world.
+            (self.directory / self.MANIFEST).unlink(missing_ok=True)
+            return
+        if self._staged:
+            self._record({**self._previous, **{target.name: self._used[target] for target in self._staged}})
         for target, staged in self._staged.items():
-            digests[target.name] = file_digest(staged)
             # Replacing the name replaces a link there, never the file it points to.
             os.replace(staged, target)
         self._staged.clear()
-        manifest = self.directory / self.MANIFEST
+
+    def finish(self):
+        """Once the new XML is in place, remove the stale files of a per-XML folder and record its manifest."""
         if self.shared:
-            # A folder that became shared no longer belongs to one world.
-            manifest.unlink(missing_ok=True)
             return
-        files = sorted(path.name for path in self.written if path.parent == self.directory)
+        files = {path.name: self._used[path] for path in self.written if path.parent == self.directory}
         for name, digest in self._previous.items():
             if name not in files:
                 path = self._stale(name, digest)
                 if path is not None:
                     path.unlink(missing_ok=True)
-        record = {"files": files, "sha256": {name: digests[name] for name in files}}
-        _replace_file(manifest, lambda target: target.write_text(json.dumps(record, indent=1) + "\n", encoding="utf-8"))
-        self._previous = dict(record["sha256"])
+        self._record(files)
+        self._previous = files
 
     def close(self):
         if self._stage is not None:
@@ -756,13 +839,44 @@ def _replace_file(path, write):
         temporary.unlink(missing_ok=True)
 
 
-def write_xml(root, path):
+def xml_bytes(root):
+    """The file content of the MJCF ``root``: indented two spaces, UTF-8 with an XML declaration."""
     ET.indent(root, space="  ")
-    _replace_file(path, lambda target: ET.ElementTree(root).write(target, encoding="utf-8", xml_declaration=True))
+    return ET.tostring(root, encoding="utf-8", xml_declaration=True)
 
 
-def write_text(path, text):
-    _replace_file(path, lambda target: target.write_text(text, encoding="utf-8"))
+def _install(temporary, path):
+    """Move the finished output file ``temporary`` to ``path``; replacing a link there, not its target."""
+    os.replace(temporary, path)
+
+
+def publish(assets, outputs):
+    """Install an export: its asset files, then its output files, then the asset cleanup.
+
+    ``outputs`` lists ``(path, data)`` pairs, the XML first, then the report and
+    other text files. Every output is written to a temporary sibling before
+    anything is replaced, so a failure while writing changes nothing. Then
+    ``assets.commit()`` moves the staged assets into place, the outputs replace
+    their files in order, and only then does ``assets.finish()`` remove the
+    files the previous export used: until the new XML is in place, every file
+    the old XML references still exists.
+    """
+    temporaries = []
+    try:
+        for path, data in outputs:
+            path = Path(path)
+            temporary = _new_sibling(path)
+            temporaries.append((temporary, path))
+            temporary.write_bytes(data)
+            if path.is_file() and not path.is_symlink():
+                shutil.copymode(path, temporary)
+        assets.commit()
+        for temporary, path in temporaries:
+            _install(temporary, path)
+        assets.finish()
+    finally:
+        for temporary, _path in temporaries:
+            temporary.unlink(missing_ok=True)
 
 
 def mask_value(settings, name):
@@ -837,12 +951,23 @@ def skip_faceless(context, objects):
     return kept, notes
 
 
-def _export_simple(context, filepath, *, regroup=False):
+def uncovered_bake_source(obj):
+    """Warning for a bake source whose visual is exported because no atlas covers it."""
+    return (f"{obj.name}: marked as a bake source, but no baked atlas contains it (it was copied after baking, or the "
+            "atlas was baked without it), so its own visual was exported. Rebake, or use 'Edit original surfaces' to "
+            "clear the mark.")
+
+
+def _export_simple(context, filepath, *, regroup=False, candidates=None):
     """Write an ordinary (not adopted) world; works in UI and Blender background mode.
 
     With ``regroup``, body group Empties become compound bodies first. Files
     are written only once the whole world is built, so a failed export keeps
-    the previous XML, report and per-XML assets.
+    the previous XML, report and per-XML assets. ``candidates`` lists the
+    objects to export, like a selection, regardless of selection and
+    visibility (hidden bake sources keep their colliders); by default the
+    selection or the whole scene is used, as 'Export selected objects only'
+    says.
     """
     from .project import _included, body_owner, check_evaluated, is_body, regroup_export, validate_parts
     scene = context.scene
@@ -853,8 +978,11 @@ def _export_simple(context, filepath, *, regroup=False):
     unit = float(scene.unit_settings.scale_length)
     if unit <= 0:
         raise ExportError("Scene unit scale must be positive.")
-    candidates = list(context.selected_objects) if settings.selected_only else list(scene.objects)
-    if settings.selected_only:
+    chosen = candidates is not None or settings.selected_only
+    if candidates is None:
+        candidates = list(context.selected_objects) if settings.selected_only else list(scene.objects)
+    candidates = list(candidates)
+    if chosen:
         for obj in list(candidates):
             if is_body(obj):
                 candidates.extend(obj.children_recursive)
@@ -886,16 +1014,15 @@ def _export_simple(context, filepath, *, regroup=False):
                                      notes)
         if regroup:
             report = regroup_export(context, root, report)
-        assets.commit()
-        write_xml(root, filepath)
-        write_text(filepath.parent / "export_report.json", json.dumps(report, indent=2) + "\n")
-        write_text(filepath.parent / "OPEN_WORLD.txt",
-                   f"MuJoCo 3.15+\n\nOpen with:\n  python -m mujoco.viewer --mjcf={filepath.name}\n\n"
-                   f"Keep the XML and asset folder ({asset_prefix}) together. All asset paths are relative.\n"
-                   "In the viewer, double-click a movable object/door, then Ctrl+right-drag to apply force.\n"
-                   "Visual meshes do not collide. Collision shapes and the analytic floor are in group 3.\n"
-                   "For an omniwheel robot, preserve its explicit wheel-capsule/floor contact pairs when merging.\n"
-                   "This isolated world does not contain a robot or ROS controller configuration.\n")
+        guide = (f"MuJoCo 3.15+\n\nOpen with:\n  python -m mujoco.viewer --mjcf={filepath.name}\n\n"
+                 f"Keep the XML and asset folder ({asset_prefix}) together. All asset paths are relative.\n"
+                 "In the viewer, double-click a movable object/door, then Ctrl+right-drag to apply force.\n"
+                 "Visual meshes do not collide. Collision shapes and the analytic floor are in group 3.\n"
+                 "For an omniwheel robot, preserve its explicit wheel-capsule/floor contact pairs when merging.\n"
+                 "This isolated world does not contain a robot or ROS controller configuration.\n")
+        publish(assets, [(filepath, xml_bytes(root)),
+                         (filepath.parent / "export_report.json", (json.dumps(report, indent=2) + "\n").encode("utf-8")),
+                         (filepath.parent / "OPEN_WORLD.txt", guide.encode("utf-8"))])
     finally:
         assets.close()
     return report
@@ -954,9 +1081,8 @@ def _build_simple(context, filepath, objects, labels, candidates, unit, plane_ma
         # A bake source's visual is replaced by the atlas, but only while an
         # atlas actually covers it.
         replaced = bool(obj.get("mjworld_bake_source")) and obj.name in covered
-        if obj.get("mjworld_bake_source") and not replaced:
-            warnings.append(f"{obj.name}: marked as a bake source, but no baked atlas contains it, so its own visual was exported. "
-                            "Rebake, or use 'Edit original surfaces' to clear the mark.")
+        if obj.get("mjworld_bake_source") and not replaced and cfg.role != "COLLIDER":
+            warnings.append(uncovered_bake_source(obj))
         if cfg.role != "COLLIDER" and not replaced:
             for material_id, tri in geometry["triangles"]:
                 by_material.setdefault(material_id, []).append(tri)
@@ -993,7 +1119,7 @@ def _build_simple(context, filepath, objects, labels, candidates, unit, plane_ma
                         image_file = assets.write(image_name + ".png",
                                                   lambda target: written.update(_write_image(image, target, baked=baked, scene=scene, where=where)),
                                                   content_named=True)
-                        if image.is_float and baked:
+                        if written["hdr"]:
                             warnings.append(f"{obj.name}: HDR bake '{image.name}' converted to display PNG using {profile_text(written['profile'])}. Keep that view transform consistent when comparing Blender and MuJoCo.")
                         warnings.extend(f"{where}: {note}" for note in written["notes"])
                         ET.SubElement(asset, "texture", name=image_name, type="2d", file=image_file,
