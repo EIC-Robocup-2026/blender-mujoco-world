@@ -1,5 +1,8 @@
-"""MuJoCo verification for test_compound_blender.py output; no GUI needed."""
-import copy
+"""MuJoCo checks of the test_compound_blender.py output; no GUI needed.
+
+Run:
+  python tests/validate_compound.py OUTPUT_DIR
+"""
 import json
 import math
 from pathlib import Path
@@ -9,7 +12,10 @@ import xml.etree.ElementTree as ET
 import mujoco
 import numpy as np
 
-path = Path(sys.argv[1])
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import harness  # noqa: E402
+
+path, _, marker = harness.completed_output("compound")
 model = mujoco.MjModel.from_xml_path(str(path / "fresh.xml"))
 assert model.nq == 8 and model.nv == 7
 cup = model.body("Hollow_cup")
@@ -34,7 +40,13 @@ assert 0.065 < relative_z < 0.095, relative_z
 assert all(data.warning[i].number == 0 for i in range(len(data.warning)))
 grouped = mujoco.MjModel.from_xml_path(str(path / "grouped.xml"))
 assert grouped.nq == 15 and abs(grouped.body("Grouped_prop").mass[0] - .5) < 1e-6
-if (path / "edited.xml").exists():
+if marker["details"]["real_project"]:
+    # The existing project's exports use the shared folder inside the output.
+    for name in ("adopted.xml", "edited.xml"):
+        compiler = ET.parse(path / name).getroot().find("compiler")
+        for attribute in ("meshdir", "texturedir"):
+            if compiler is not None and compiler.get(attribute):
+                assert (path / compiler.get(attribute)).resolve() == path / "shared_assets", (name, compiler.attrib)
     edits = json.loads((path / "edits.json").read_text())
     original = mujoco.MjModel.from_xml_path(str(path / "adopted.xml"))
     edited = mujoco.MjModel.from_xml_path(str(path / "edited.xml"))

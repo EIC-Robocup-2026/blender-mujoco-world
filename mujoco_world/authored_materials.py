@@ -6,7 +6,7 @@ import xml.etree.ElementTree as ET
 
 
 def _description(obj):
-    from .exporter import inspect_material
+    from .exporter import inspect_material, material_uses_nodes
     material = obj.material_slots[0].material if obj.material_slots else None
     info = inspect_material(material)
     image = info["image"]
@@ -17,7 +17,7 @@ def _description(obj):
                 "image_size": list(image.size) if image else None,
                 "uv_map": info.get("uv_map"),
                 "baked": bool(obj.mujoco_world.baked)}
-    if material and material.use_nodes:
+    if material_uses_nodes(material):
         shader = next((node for node in material.node_tree.nodes
                        if node.type == "BSDF_PRINCIPLED"), None)
         if shader:
@@ -36,28 +36,31 @@ def capture_material_baselines(scene, root):
         obj["mjworld_material_baseline"] = json.dumps(snapshot, sort_keys=True)
 
 
-def update_authored_materials(scene, root, assets_path, asset_prefix=None):
+def update_authored_materials(scene, root, assets, asset_prefix, geoms):
     """Export changed simple colours/images per object, retaining source physics.
 
-    Complex shader changes still need the static bake. A reassigned material
-    gets a new material reference on that object rather than changing every
-    object that used the imported material.
+    ``geoms`` maps each exported adopted object to its geom element, and
+    ``assets`` is the export's AssetWriter. Complex shader changes still need
+    the static bake. A reassigned material gets a new material reference on
+    that object rather than changing every object that used the imported
+    material.
     """
-    from .exporter import _write_image, numbers, slug, srgb
-    asset_prefix = assets_path.name if asset_prefix is None else asset_prefix
+    from .baking import bake_covered
+    from .exporter import _write_image, image_problem, numbers, profile_text, property_numbers, slug, srgb, texture_colorspace
     asset = root.find("asset")
     if asset is None:
         asset = ET.SubElement(root, "asset")
-    geoms = {geom.get("name"): geom for geom in root.findall("./worldbody//geom")}
     warnings = []
     exported = {}
+    covered = bake_covered(scene)
     for obj in scene.objects:
         raw = obj.get("mjworld_mjcf_geom")
         previous = obj.get("mjworld_material_baseline")
         if obj.type != "MESH" or not raw or previous is None:
             continue
-        geom = geoms.get(json.loads(raw).get("name"))
-        if geom is None or obj.mujoco_world.role == "COLLIDER" or obj.get("mjworld_bake_source"):
+        geom = geoms.get(obj)
+        # A bake source keeps its baseline appearance while an atlas replaces it.
+        if geom is None or obj.mujoco_world.role == "COLLIDER" or (obj.get("mjworld_bake_source") and obj.name in covered):
             continue
         info, snapshot = _description(obj)
         current = json.dumps(snapshot, sort_keys=True)
@@ -76,13 +79,23 @@ def update_authored_materials(scene, root, assets_path, asset_prefix=None):
                 rgba[:3] = [srgb(value) for value in rgba[:3]]
             baked = bool(snapshot["baked"] or info["emission"])
             attributes = {"name": label, "rgba": numbers(rgba), "specular": "0",
-                          "emission": str(scene.mujoco_world.baked_emission if baked else 0)}
+                          "emission": property_numbers([scene.mujoco_world.baked_emission if baked else 0])}
+            problem = image_problem(image) if image else None
+            if problem:
+                warnings.append(f"{obj.name}: image '{image.name}' {problem}; export used the flat material colour.")
+                image = None
             if image:
-                filename = label + ".png"
-                _write_image(image, assets_path / filename, baked=baked, scene=scene)
+                written = {}
+                filename = assets.write(label + ".png", lambda target: written.update(
+                    _write_image(image, target, baked=baked, scene=scene, where=obj.name)))
+                if written["hdr"]:
+                    warnings.append(f"{obj.name}: HDR bake '{image.name}' converted to display PNG using "
+                                    f"{profile_text(written['profile'])}. Keep that view transform consistent when "
+                                    "comparing Blender and MuJoCo.")
+                warnings.extend(f"{obj.name}: {note}" for note in written["notes"])
                 ET.SubElement(asset, "texture", name=label + "_texture", type="2d",
                               file=asset_prefix + "/" + filename,
-                              colorspace="linear" if scene.mujoco_world.texture_mode == "DISPLAY" else "sRGB")
+                              colorspace=texture_colorspace(scene.mujoco_world, written["linear"]))
                 attributes.update(texture=label + "_texture", rgba=f"1 1 1 {rgba[3]:.9g}",
                                   texuniform="false")
             ET.SubElement(asset, "material", **attributes)

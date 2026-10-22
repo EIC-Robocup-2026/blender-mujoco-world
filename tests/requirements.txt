@@ -1,0 +1,5 @@
+# Python packages the validators and tests/run_all.sh need outside Blender.
+# Blender itself is not a pip package; pass its executable as BLENDER.
+mujoco>=3.15
+numpy
+Pillow

@@ -1,18 +1,27 @@
-"""Run with Blender --background --python tests/build_smoke_scene.py."""
+"""Smoke export of a generated scene: transforms, textures, roles, floor plane options.
+
+Run:
+  blender --background --factory-startup --python-exit-code 1 \
+      --python tests/build_smoke_scene.py -- OUTPUT_DIR
+Then validate the written worlds with MuJoCo:
+  python tests/validate_export.py OUTPUT_DIR [WALKIE_ROS_ROOT]
+
+Every scene is generated here; nothing outside OUTPUT_DIR is written. The
+generated scene is saved as OUTPUT_DIR/smoke_scene.blend for inspection.
+"""
 import json
-import math
 from pathlib import Path
 import sys
 
 import bpy
-from mathutils import Vector
 
-ROOT = Path(__file__).resolve().parents[1]
-sys.path.insert(0, str(ROOT))
-import mujoco_world
-from mujoco_world.exporter import export_world
+sys.dont_write_bytecode = True  # Blender ignores PYTHONDONTWRITEBYTECODE.
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import harness  # noqa: E402
 
-mujoco_world.register()
+OUT, _ = harness.begin("smoke")
+from mujoco_world.exporter import export_world  # noqa: E402
+
 bpy.ops.object.select_all(action="SELECT")
 bpy.ops.object.delete(use_global=False)
 bpy.context.scene.unit_settings.system = "METRIC"
@@ -41,7 +50,8 @@ for y in range(32):
         pixels.extend([x / 31, y / 31, 0.4, 1])
 image.pixels[:] = pixels
 material = bpy.data.materials.new("Baked emission image")
-material.use_nodes = True
+if bpy.app.version < (5, 0, 0):
+    material.use_nodes = True  # Blender 5 always uses the node tree.
 nodes = material.node_tree.nodes
 nodes.clear()
 texture = nodes.new("ShaderNodeTexImage")
@@ -60,7 +70,8 @@ for y in range(16):
         hdr_pixels.extend([value, value, value, 1])
 hdr.pixels[:] = hdr_pixels
 hdr_material = bpy.data.materials.new("HDR bake emission")
-hdr_material.use_nodes = True
+if bpy.app.version < (5, 0, 0):
+    hdr_material.use_nodes = True
 hdr_nodes = hdr_material.node_tree.nodes
 hdr_nodes.clear()
 hdr_texture = hdr_nodes.new("ShaderNodeTexImage")
@@ -124,8 +135,7 @@ for obj in bpy.context.scene.objects:
         expected[obj.name] = [list(evaluated.matrix_world @ v.co * 0.01) for v in mesh.vertices]
         evaluated.to_mesh_clear()
 
-out = ROOT / "tests" / "output"
-out.mkdir(exist_ok=True)
+out = OUT
 report = export_world(bpy.context, str(out / "scene.xml"))
 (out / "source_buffer_check.json").write_text(json.dumps({"hdr_max": max(hdr.pixels), "hdr_filepath": hdr.filepath}))
 # Independent reference through Blender's display-render save path.
@@ -137,15 +147,33 @@ image_settings.color_depth = "8"
 hdr.save_render(str(out / "hdr_agx_reference.png"), scene=bpy.context.scene)
 image_settings.file_format, image_settings.color_mode, image_settings.color_depth = previous
 (out / "expected_vertices.json").write_text(json.dumps(expected))
-bpy.ops.wm.save_as_mainfile(filepath=str(ROOT / "example.blend"))
+# Save the generated scene with the other test outputs for inspection.
+bpy.ops.wm.save_as_mainfile(filepath=str(out / "smoke_scene.blend"))
+settings = bpy.context.scene.mujoco_world
+# The export operator writes the same world and remembers the path; the
+# browser of a saved file starts in a folder that is not named after the add-on.
+assert bpy.ops.mjworld.export_world(filepath=str(out / "operator" / "scene.xml")) == {"FINISHED"}
+assert settings.last_export == str(out / "operator" / "scene.xml"), settings.last_export
+import mujoco_world  # noqa: E402
+
+assert mujoco_world.default_export_path("") == str(out / "mujoco_export" / "scene.xml")
+# Floor plane options: none at all, and a raised plane.
+settings.plane = False
+no_plane = export_world(bpy.context, str(out / "no_plane" / "scene.xml"))
+assert not no_plane["plane"]["enabled"]
+settings.plane, settings.plane_height = True, 0.05
+raised = export_world(bpy.context, str(out / "raised_plane" / "scene.xml"))
+assert raised["plane"]["height_m"] == 0.05, raised["plane"]
+settings.plane_height = 0.0
 # Exercise the selection-only path too.
 bpy.ops.object.select_all(action="DESELECT")
 prop.select_set(True)
 bpy.context.view_layer.objects.active = prop
-bpy.context.scene.mujoco_world.selected_only = True
+settings.selected_only = True
 selected = export_world(bpy.context, str(out / "selected" / "scene.xml"))
 assert selected["objects"] == 1
-bpy.context.scene.mujoco_world.selected_only = False
+settings.selected_only = False
 bpy.ops.mjworld.walkie_contacts()
 export_world(bpy.context, str(out / "walkie_masks" / "scene.xml"))
+harness.complete(out, "smoke")
 print("SMOKE_EXPORT_OK", json.dumps({k: report[k] for k in ("objects", "meshes", "textures", "triangles", "warnings")}))

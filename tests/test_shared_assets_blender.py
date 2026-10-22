@@ -1,8 +1,17 @@
-"""Export both existing room variants twice into one shared portable asset folder.
+"""Export both variants of an existing room twice into one shared asset folder.
 
-Blender --background --factory-startup --python this_file.py -- ROOM_ROOT OUTPUT
-The room root supplies scene.xml/chula_pat14_6.blend and realistic equivalents.
-Source projects are opened read-only; no blend file is saved.
+Run:
+  blender --background --factory-startup --python-exit-code 1 \
+      --python tests/test_shared_assets_blender.py -- OUTPUT_DIR ROOM_ROOT
+Then compile the written worlds with MuJoCo:
+  python tests/validate_compile.py shared_assets OUTPUT_DIR
+
+ROOM_ROOT is a room project with scene.xml and chula_pat14_6.blend, and a
+second variant in baked/scene.xml and baked/baked.blend (the layout of
+simulation/mujoco/worlds/chula_pat14_6 in walkie-ros) or in
+realistic/scene.xml and realistic/realistic.blend (the original project); the
+test expects its task_apple_1_00 object. Pass a copy of the project: its
+blend files are opened but never saved, and every export goes to OUTPUT_DIR.
 """
 import json
 import hashlib
@@ -12,17 +21,21 @@ import xml.etree.ElementTree as ET
 
 import bpy
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-import mujoco_world
-from mujoco_world.exporter import _export_simple, export_world
-from mujoco_world.project import adopt_mjcf
+sys.dont_write_bytecode = True  # Blender ignores PYTHONDONTWRITEBYTECODE.
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import harness  # noqa: E402
 
-mujoco_world.register()
-args = sys.argv[sys.argv.index("--") + 1:]
-room, output = (Path(value).resolve() for value in args)
+output, args = harness.begin("shared_assets", "OUTPUT_DIR ROOM_ROOT", 2, 2)
+from mujoco_world.exporter import _export_simple, export_world  # noqa: E402
+from mujoco_world.project import adopt_mjcf  # noqa: E402
+
+room = Path(args[0]).resolve()
 shared = output / "scene_assets"
+second = next((name for name in ("baked", "realistic") if (room / name / f"{name}.blend").is_file()), None)
+if second is None:
+    raise SystemExit(f"{room} has neither baked/baked.blend nor realistic/realistic.blend")
 variants = [(room / "chula_pat14_6.blend", room / "scene.xml", output / "scene.xml"),
-            (room / "realistic/realistic.blend", room / "realistic/scene.xml", output / "realistic/scene.xml")]
+            (room / second / f"{second}.blend", room / second / "scene.xml", output / second / "scene.xml")]
 
 
 def check_paths(path):
@@ -39,18 +52,36 @@ def check_paths(path):
     assert len(root.findall(".//geom[@type='plane']")) == 1
 
 
+def adopt_variant(xml):
+    """Adopt ``xml`` and export into ``shared``.
+
+    The second variant's scene.xml names ../scene_assets, the room's own
+    library outside its folder. Exporting into another shared folder copies those files, which
+    needs the opt-in.
+    """
+    adopt_mjcf(bpy.context, str(xml))
+    settings = bpy.context.scene.mujoco_world
+    settings.asset_directory = str(shared)
+    settings.allow_outside_assets = xml.parent != room
+
+
+def check_outside_notes(report, xml):
+    """Only the second variant copies files from outside its folder, each with a note."""
+    notes = [w for w in report["warnings"] if "from outside the adopted world's folder" in w]
+    assert bool(notes) == (xml.parent != room), (xml, notes)
+
+
 counts = []
 for repetition in range(2):
     for blend, xml, target in variants:
         bpy.ops.wm.open_mainfile(filepath=str(blend))
-        adopt_mjcf(bpy.context, str(xml))
+        adopt_variant(xml)
         scene = bpy.context.scene
-        scene.mujoco_world.asset_directory = str(shared)
         # Exercise the internal temporary ordinary-export path too.
         bpy.ops.mesh.primitive_cube_add(size=0.1, location=(10, 10, 1))
         prop = bpy.context.object
         prop.name, prop.mujoco_world.role = "Shared_export_added_prop", "FREE"
-        export_world(bpy.context, str(target))
+        check_outside_notes(export_world(bpy.context, str(target)), xml)
         assert scene.mujoco_world.asset_directory == str(shared)
         check_paths(target)
     counts.append(len(list(shared.iterdir())))
@@ -68,7 +99,8 @@ check_paths(generic)
 image = bpy.data.images.new("Shared generic label", width=2, height=2)
 image.pixels[:] = [1, 0, 0, 1] * 4
 material = bpy.data.materials.new("Shared generic material")
-material.use_nodes = True
+if bpy.app.version < (5, 0, 0):
+    material.use_nodes = True  # Blender 5 always uses the node tree.
 texture = material.node_tree.nodes.new("ShaderNodeTexImage")
 texture.image = image
 material.node_tree.links.new(texture.outputs["Color"], material.node_tree.nodes.get("Principled BSDF").inputs["Base Color"])
@@ -89,5 +121,66 @@ _export_simple(bpy.context, str(generic_red))
 assert len(list(shared.iterdir())) == before_repeat
 check_paths(generic_red)
 check_paths(generic_blue)
+
+
+def referenced(path):
+    """Hash of every asset file a world references."""
+    root = ET.parse(path).getroot()
+    compiler = root.find("compiler")
+    hashes = {}
+    for element in root.findall("./asset/*"):
+        if element.get("file"):
+            directory = compiler.get("meshdir" if element.tag == "mesh" else "texturedir", "")
+            resolved = (path.parent / directory / element.get("file")).resolve()
+            hashes[resolved.name] = hashlib.sha256(resolved.read_bytes()).hexdigest()
+    return hashes
+
+
+def export_variant(variant, edit=False):
+    blend, xml, target = variant
+    bpy.ops.wm.open_mainfile(filepath=str(blend))
+    adopt_variant(xml)
+    bpy.ops.mesh.primitive_cube_add(size=0.2 if edit else 0.1, location=(10, 10, 1))
+    added = bpy.context.object
+    added.name, added.mujoco_world.role = "Shared_export_added_prop", "FREE"
+    if edit:
+        bpy.context.scene.objects["task_apple_1_00"].scale *= 1.5
+    bpy.context.view_layer.update()
+    export_world(bpy.context, str(target))
+    check_paths(target)
+    return referenced(target)
+
+
+def folder_hashes():
+    return {path.name: hashlib.sha256(path.read_bytes()).hexdigest() for path in shared.iterdir()}
+
+
+def mesh_file(path, geom_name):
+    root = ET.parse(path).getroot()
+    mesh = root.find(f".//geom[@name='{geom_name}']").get("mesh")
+    return Path(root.find(f"./asset/mesh[@name='{mesh}']").get("file")).name
+
+
+# Editing one variant never changes a file the other variant references: a
+# name-based asset whose content differs gets a content-addressed name.
+cross_variant = {}
+for untouched, edited in ((variants[0], variants[1]), (variants[1], variants[0])):
+    before = export_variant(untouched)
+    existing = folder_hashes()
+    after_edit = export_variant(edited, edit=True)
+    edited_apple = mesh_file(edited[2], "task_apple_1_00")
+    current = folder_hashes()
+    assert all(current[name] == digest for name, digest in existing.items()), \
+        sorted(name for name, digest in existing.items() if current.get(name) != digest)
+    assert referenced(untouched[2]) == before, sorted(name for name, value in referenced(untouched[2]).items() if before.get(name) != value)
+    unchanged = export_variant(edited)
+    # The edited apple is written under a content name next to the old file,
+    # which the unchanged re-export references again.
+    assert edited_apple.startswith("mesh_") and edited_apple not in unchanged, edited_apple
+    assert mesh_file(edited[2], "task_apple_1_00") == "task_apple_1_00_authored_mesh.obj"
+    assert referenced(untouched[2]) == before
+    cross_variant[untouched[2].parent.name] = edited_apple
+harness.complete(output, "shared_assets")
 print("SHARED_ASSETS_TEST_OK", json.dumps({"output": str(output), "files_after_each_pair": counts,
+                                           "cross_variant_content_named": cross_variant,
                                            "scenes": [str(v[2]) for v in variants] + [str(generic), str(generic_red), str(generic_blue)]}))
