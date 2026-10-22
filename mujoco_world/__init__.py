@@ -50,12 +50,14 @@ def default_export_path(last_export):
     """Start the export browser at the last export, or beside a saved .blend.
 
     An unsaved file resolves '//' against Blender's working directory, so it
-    gets ExportHelper's own default instead.
+    gets ExportHelper's own default instead. The default folder is not named
+    after the add-on package, so a .blend saved next to the add-on source
+    never exports into the package directory.
     """
     if last_export and (bpy.data.filepath or not last_export.startswith("//")):
         return bpy.path.abspath(last_export)
     if bpy.data.filepath:
-        return bpy.path.abspath("//mujoco_world/scene.xml")
+        return bpy.path.abspath("//mujoco_export/scene.xml")
     return ""
 
 

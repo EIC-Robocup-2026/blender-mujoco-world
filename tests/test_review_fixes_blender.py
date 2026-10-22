@@ -723,19 +723,19 @@ def operators():
         warnings.simplefilter("always")
         scene.mujoco_world.asset_directory = "//scene_assets"
         scene.mujoco_world.bake_directory = "//bake"
-        scene.mujoco_world.last_export = "//mujoco_world/scene.xml"
+        scene.mujoco_world.last_export = "//mujoco_export/scene.xml"
     relative_warnings = [str(w.message) for w in caught if "blend relative" in str(w.message)]
     if bpy.app.version >= (4, 5, 0):
         assert not relative_warnings, relative_warnings
     scene.mujoco_world.asset_directory = scene.mujoco_world.bake_directory = scene.mujoco_world.last_export = ""
     # Export browser default.
     assert mujoco_world.default_export_path("") == ""
-    assert mujoco_world.default_export_path("//mujoco_world/scene.xml") == ""
+    assert mujoco_world.default_export_path("//mujoco_export/scene.xml") == ""
     assert mujoco_world.default_export_path("/tmp/world/scene.xml") == "/tmp/world/scene.xml"
     saved = OUT / "operators" / "saved.blend"
     saved.parent.mkdir()
     bpy.ops.wm.save_as_mainfile(filepath=str(saved))
-    assert mujoco_world.default_export_path("") == str(saved.parent / "mujoco_world" / "scene.xml")
+    assert mujoco_world.default_export_path("") == str(saved.parent / "mujoco_export" / "scene.xml")
     assert mujoco_world.default_export_path("//other/scene.xml") == str(saved.parent / "other" / "scene.xml")
     # Restore: poll and report.
     scene = fresh_scene()
