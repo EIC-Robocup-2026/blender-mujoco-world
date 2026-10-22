@@ -583,6 +583,45 @@ def bake_light_linking():
 
 
 @section
+def bake_shadow_linking():
+    """A source in a lamp's blocker collection keeps casting its shadow in the bake."""
+    def bake(label, linked):
+        """Bake a white floor under a lamp and a black occluder; return the atlas's mean red and lit texels."""
+        scene = bake_scene(strength=0.0)
+        bpy.ops.mesh.primitive_plane_add(size=3)
+        floor = bpy.context.object
+        floor.name = "Floor"
+        floor.mujoco_world.role = "VISUAL"
+        floor.data.materials.append(material("white", (0.8, 0.8, 0.8)))
+        occluder = box("Occluder", (0, 0, 0.8), (0.4, 0.4, 0.4), mat=material("black", (0, 0, 0)))
+        lamp = bpy.data.objects.new("Lamp", bpy.data.lights.new("Lamp", "POINT"))
+        lamp.data.energy, lamp.data.shadow_soft_size = 400, 0.0
+        scene.collection.objects.link(lamp)
+        lamp.location = (0, 0, 2)
+        blockers = before = None
+        if linked:
+            # Only a blocker collection: one that is also the receiver
+            # collection would admit the clone through the receiver side.
+            blockers = bpy.data.collections.new("Lamp blockers")
+            blockers.objects.link(occluder)
+            lamp.light_linking.blocker_collection = blockers
+            before = link_states(blockers)
+        result = bake_static(bpy.context, str(OUT / label), atlas_size=64, samples=8, margin=1)
+        if linked:
+            assert link_states(blockers) == before, link_states(blockers)
+        red = [texel[0] for texel in texels(atlas_image(result))]
+        return sum(red) / len(red), sum(1 for value in red if value > 0.05), before
+
+    plain_mean, plain_lit, _ = bake("shadow_plain_bake", False)
+    linked_mean, linked_lit, states = bake("shadow_linked_bake", True)
+    # Without the clone in the blocker collection nothing blocks the lamp, and
+    # the floor under the occluder bakes lit.
+    assert abs(linked_mean - plain_mean) <= 0.05 * plain_mean, f"mean {linked_mean} linked, {plain_mean} unlinked"
+    assert abs(linked_lit - plain_lit) <= max(5, plain_lit // 20), f"{linked_lit} lit texels linked, {plain_lit} unlinked"
+    return {"plain": [plain_mean, plain_lit], "linked": [linked_mean, linked_lit], "states": states}
+
+
+@section
 def bake_source_refs():
     """The atlas follows a renamed source; a copy of a source exports its own visual, with a warning."""
     scene = bake_scene()

@@ -709,9 +709,10 @@ def per_xml_in_shared_folder():
 
 @section
 def failed_xml_install():
-    """When the new XML cannot be installed, the old XML, its report and every file it names stay."""
+    """When the new assets or XML cannot be installed, the old XML, its report and every file it names stay."""
     directory = OUT / "failed_install"
     original = exporter._install
+    real_replace = exporter.os.replace
 
     def broken(temporary, path):
         if Path(path).suffix == ".xml":
@@ -729,6 +730,25 @@ def failed_xml_install():
             raise AssertionError("the simulated install failure did not stop the export")
         finally:
             exporter._install = original
+
+    def failing_move(source, target, *args, **kwargs):
+        # Only moves out of an AssetWriter's staging folder fail.
+        if ".mjworld-stage-" in str(source):
+            raise OSError("simulated asset install failure")
+        return real_replace(source, target, *args, **kwargs)
+
+    def asset_attempt(target):
+        """Fail the first staged asset move. Assets go in before the XML, so the XML must not change."""
+        bpy.context.view_layer.update()
+        exporter.os.replace = failing_move
+        try:
+            export_world(bpy.context, str(target))
+        except OSError as exc:
+            assert "simulated asset install failure" in str(exc), str(exc)
+        else:
+            raise AssertionError("the export moved no staged asset, so the simulated failure never happened")
+        finally:
+            exporter.os.replace = real_replace
 
     def check(target, old_xml, old_report):
         assert target.read_bytes() == old_xml, "the old XML was replaced"
@@ -756,6 +776,8 @@ def failed_xml_install():
     old = simple.read_bytes(), (simple.parent / "export_report.json").read_bytes()
     bpy.context.scene.objects["Crate"].name = "Crate_renamed"
     bpy.data.objects.remove(bpy.context.scene.objects["Stool"])
+    asset_attempt(simple)
+    check(simple, *old)
     attempt(simple)
     check(simple, *old)
     export_world(bpy.context, str(simple))
@@ -767,6 +789,8 @@ def failed_xml_install():
     old = adopted.read_bytes(), (adopted.parent / "export_report.json").read_bytes()
     bpy.context.scene.objects["Bin_solid"].scale = (1.5, 1.5, 1.5)
     bpy.data.objects.remove(bpy.context.scene.objects["Bin_skin"])
+    asset_attempt(adopted)
+    check(adopted, *old)
     attempt(adopted)
     check(adopted, *old)
     export_world(bpy.context, str(adopted))
@@ -785,6 +809,14 @@ PART_NAMES = """<mujoco model="part_names">
     <body name="Shelf" pos="-1 0 0.5">
       <geom name="Shelf_board" type="box" size="0.3 0.2 0.02"/>
       <geom name="Book_000_collision" type="box" size="0.05 0.05 0.05" pos="0.2 0 0.07"/>
+    </body>
+    <body name="Cabinet" pos="0 2 0.5">
+      <joint name="Drawer_hinge" type="hinge" axis="0 0 1" range="-1 0"/>
+      <geom name="Cabinet_box" type="box" size="0.2 0.2 0.2" mass="1"/>
+    </body>
+    <body name="Tub" pos="0 -2 0.3">
+      <freejoint name="Box_free"/>
+      <geom name="Tub_box" type="box" size="0.1 0.1 0.1" mass="1"/>
     </body>
   </worldbody>
 </mujoco>
@@ -806,6 +838,10 @@ def new_part_names():
     shelf = empty("Shelf", (-1, 0, 0.5))
     box("Shelf_board", (-1, 0, 0.5), (0.3, 0.2, 0.02), parent=shelf)
     box("Book_000_collision", (-0.8, 0, 0.57), (0.05, 0.05, 0.05), parent=shelf)
+    cabinet = empty("Cabinet", (0, 2, 0.5))
+    box("Cabinet_box", (0, 2, 0.5), (0.2, 0.2, 0.2), parent=cabinet)
+    tub = empty("Tub", (0, -2, 0.3))
+    box("Tub_box", (0, -2, 0.3), (0.1, 0.1, 0.1), parent=tub)
     bpy.context.view_layer.update()
     adopt_mjcf(bpy.context, str(source))
     messages = {}
@@ -819,15 +855,42 @@ def new_part_names():
     messages["grouped"] = expect_error("'Book' (geom 'Book_000_collision')", directory / "grouped" / "scene.xml")
     assert "Lantern" not in messages["grouped"], messages["grouped"]
     book.name = "Novel"
+    # A new body group's body is named after its Empty, and its joint after the body.
+    drawer = empty("Drawer", (-2, 2, 0.5), "HINGE", body=True)
+    box("Drawer_front", (-2, 2, 0.5), (0.2, 0.02, 0.2), parent=drawer)
+    messages["hinge_group"] = expect_error("'Drawer' (joint 'Drawer_hinge')", directory / "hinge_group" / "scene.xml")
+    drawer.name = "Hatch"
+    crate = empty("Box", (2, -2, 0.3), "FREE", body=True)
+    box("Box_part", (2, -2, 0.3), (0.1, 0.1, 0.1), parent=crate)
+    messages["free_group"] = expect_error("'Box' (freejoint 'Box_free')", directory / "free_group" / "scene.xml")
+    crate.name = "Tote"
+    # A renamed adopted body keeps its MJCF name, so a new group may not take it.
+    shelf.name = "Shelf_old"
+    cupboard = empty("Shelf", (-2, -2, 0.5), body=True)
+    box("Cupboard_board", (-2, -2, 0.5), (0.3, 0.2, 0.02), parent=cupboard)
+    messages["renamed_body"] = expect_error("'Shelf' (body 'Shelf')", directory / "renamed_body" / "scene.xml")
+    cupboard.name = "Cupboard"
+    # An adopted body made movable gets a free joint named after its object.
+    shelf.name = "Box"
+    shelf.mujoco_world.role = "FREE"
+    messages["new_role"] = expect_error("'Box' (freejoint 'Box_free')", directory / "new_role" / "scene.xml")
+    shelf.mujoco_world.role = "STATIC"
+    shelf.name = "Shelf"
     target = directory / "scene.xml"
     export_world(bpy.context, str(target))
     root = xml(target)
-    for tag in ("body", "geom", "freejoint", "joint", "site"):
-        names = [element.get("name") for element in root.iter(tag) if element.get("name")]
-        assert len(names) == len(set(names)), (tag, names)
+    # One namespace per kind; a joint and a free joint share one.
+    for tags in (("body",), ("geom",), ("joint", "freejoint"), ("site",)):
+        names = [element.get("name") for tag in tags for element in root.iter(tag) if element.get("name")]
+        assert len(names) == len(set(names)), (tags, names)
     shelf_geoms = [geom.get("name") for geom in root.find(".//body[@name='Shelf']").findall("geom")]
     assert any(name.startswith("Novel_") for name in shelf_geoms), shelf_geoms
-    assert root.find(".//body[@name='Lantern_000']") is not None
+    # A new part's body name carries its index among the new parts.
+    assert any(body.get("name").startswith("Lantern_") for body in root.find("worldbody").findall("body"))
+    assert root.find("./worldbody/body[@name='Hatch']/joint[@name='Hatch_hinge']") is not None
+    assert root.find("./worldbody/body[@name='Tote']/freejoint[@name='Tote_free']") is not None
+    assert root.find("./worldbody/body[@name='Cupboard']") is not None
+    assert root.find("./worldbody/body[@name='Shelf']/freejoint") is None
     return {"messages": messages, "export": str(target)}
 
 
