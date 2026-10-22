@@ -42,7 +42,7 @@ Objects linked from another `.blend` file are skipped by the role buttons, **Gro
 
 Hide such helpers, adopted objects and body group Empties with the eye icon (**Hide in Viewport**). Blender does not update the placement or modifiers of an object that is disabled in viewports (monitor icon) or sits in a collection excluded from the view layer, so the export stops with an error that names those objects instead of writing stale geometry.
 
-A failed export leaves the previous `scene.xml`, `export_report.json` and assets unchanged: files are written next to their targets first and replace them only after the whole world was built. The new asset files move in first, then the XML and report, and only then are the previous export's unused files removed, so even when replacing the XML itself fails, every file the old XML names still exists. In a shared asset folder, new files it had already added stay behind, but no existing file changes.
+A failed export leaves the previous `scene.xml` and `export_report.json` in place. Files are written next to their targets first and replace them only after the whole world was built, so an export that fails while building, the usual case, changes no existing file. The new asset files then move in first, then the XML and report, and only then are the previous export's unused files removed. So even when moving an asset or replacing the XML itself fails, every file the old XML names still exists, but a file the new export rewrote under the same name, such as an edited mesh, may already hold the new content; export again once the cause is fixed. In a shared asset folder, new files it had already added stay behind, but no existing file changes.
 
 For a joined room mesh with one baked atlas, choose **Visual only** in its Object type dropdown. Build separate simple boxes for the walls, furniture tops and legs, choose **Collision helper** in each box's dropdown, and keep those helpers visible in Blender: they switch to wire display and export only invisible fixed collision, so they do not cover the baked appearance. Hiding a helper excludes it entirely.
 
@@ -242,6 +242,13 @@ advanced settings → Allow adopted assets outside the MJCF folder**. The export
 then copies those files and lists each one as a warning in `export_report.json`.
 The suffix and PNG checks still apply.
 
+These checks protect you from an XML from someone else, the file you adopt. They
+do not make a `.blend` from someone else safe to export. The `.blend` stores the
+adopted XML, the path the check takes the world's folder from, and this setting,
+so a crafted one can allow any folder without a warning. Any `.blend` can also
+point an image at a local file, which an export writes into the asset folder.
+Export only `.blend` files you trust.
+
 Blender objects are often modelled with the origin at their base, while MuJoCo
 places a primitive at its centre. An adopted box, sphere, cylinder, capsule or
 ellipsoid whose object origin is elsewhere keeps that offset: the untouched geom
@@ -276,10 +283,14 @@ export stops and asks you to rename the original.
 
 New objects in an adopted world export as new bodies, or as new geoms of the
 adopted body they are parented to, with the names a new world gives them
-(`Lamp_000`, `Lamp_000_free`, `Lamp_000_collision` and so on). When one of
-these names is already a body, geom, joint or site name in the adopted XML,
-the export stops and names the objects to rename, because MuJoCo rejects a
-repeated name.
+(`Lamp_000`, `Lamp_000_free`, `Lamp_000_collision` and so on). A new body group
+exports as a body named after its Empty, with the joint `<name>_free` or
+`<name>_hinge` when it moves; an adopted body changed to **Movable object** or
+**Door** gets that joint name too. When one of these names is already a body,
+geom, joint or site name in the adopted world, the export stops and names the
+objects to rename, because MuJoCo rejects a repeated name. A renamed adopted
+object keeps its MJCF names, so a new object that takes its old Blender name
+clashes with it.
 
 ### Image export
 

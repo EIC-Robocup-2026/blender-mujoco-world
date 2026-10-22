@@ -584,11 +584,15 @@ class AssetWriter:
     different content gets a content-addressed name instead.
 
     A per-XML folder belongs to one world. Its files are staged and replace the
-    previous export's files only in commit(), so a failed export leaves the
-    previous output intact. The folder's manifest (MANIFEST) records the name
-    and SHA-256 digest of every file the last export wrote; finish(), called
-    once the new XML is in place, removes those the new export no longer
-    writes, so renamed or deleted objects leave no stale files. A stale file is
+    previous export's files only in commit(), so an export that fails before
+    commit() leaves the previous files intact. When commit() or the XML install
+    after it fails, every file the old XML names still exists, but a name the
+    new export rewrote may already hold the new content.
+
+    The folder's manifest (MANIFEST) records the name and SHA-256 digest of
+    every file the last export wrote; finish(), called once the new XML is in
+    place, removes those the new export no longer writes, so renamed or
+    deleted objects leave no stale files. A stale file is
     removed only when it is a regular file directly in the folder whose content
     still matches its recorded digest: files the manifest does not list, files
     edited since, symbolic links (and whatever they point to) and protected
