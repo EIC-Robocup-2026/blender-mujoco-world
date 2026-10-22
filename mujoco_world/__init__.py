@@ -137,6 +137,13 @@ class MJWORLD_SceneSettings(PropertyGroup):
     last_export: StringProperty(name="Last export", default="", subtype="FILE_PATH", options=_REL)
     asset_directory: StringProperty(name="Shared asset folder", default="", subtype="DIR_PATH", options=_REL,
                                    description="Optional shared folder, relative to the blend file. Empty uses an assets folder beside each exported XML")
+    # Off by default: an adopted MJCF from someone else could otherwise name
+    # any local file (an absolute or '..' path) and have it copied into the export.
+    allow_outside_assets: BoolProperty(
+        name="Allow adopted assets outside the MJCF folder", default=False,
+        description="Copy texture, height field and skin files that an adopted MJCF names outside its own folder "
+                    "(an absolute or '..' path) into the export, with a warning per file in export_report.json. "
+                    "Leave off for worlds you did not make: their paths could name any file on this computer")
     bake_directory: StringProperty(name="Bake folder", default="//baked_lighting", subtype="DIR_PATH", options=_REL,
                                    description="Folder for the lightmap EXR and PNG. A '//' path needs a saved .blend file")
     bake_size: EnumProperty(name="Atlas resolution", items=[("512", "512", "Quick preview"), ("1024", "1024", "Small world"), ("2048", "2048", "Room details"), ("4096", "4096", "Large world")], default="2048")
@@ -494,6 +501,7 @@ class MJWORLD_PT_main(Panel):
             layout.prop(settings, "movable_conaffinity")
             layout.operator("mjworld.walkie_contacts")
             layout.operator("mjworld.adopt_mjcf", icon="IMPORT")
+            layout.prop(settings, "allow_outside_assets")
 
 
 def export_menu(self, context):

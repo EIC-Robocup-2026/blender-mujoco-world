@@ -206,6 +206,26 @@ later still finds them; if neither exists, the export stops and names the folder
 it looked in. The absolute path is stored in the `.blend` file and shows the
 folder layout of the machine that adopted the world.
 
+The export copies the texture, height field and skin files the adopted XML
+names into the asset folder, so it checks them first. An XML from someone else
+could otherwise name any file on your computer, such as an SSH key, through an
+absolute or `..` path, and the export would copy it next to your world. Each
+copied file must:
+
+- lie, after following symbolic links, inside the adopted XML's folder or inside
+  the export's asset folder (a variant that names its shared library, such as
+  `realistic/scene.xml` naming `../scene_assets`, passes when that library is
+  the **Shared asset folder**);
+- end in a suffix MuJoCo reads for its element: `.png` for textures, `.png` or
+  `.bin` for height fields, `.skn` for skins; a `.png` must hold PNG data.
+
+Other asset elements that name a file, such as `<model>`, stop the export. Source
+mesh files are never read or copied, because every mesh is regenerated from the
+Blender object. For a world you trust whose files sit elsewhere, turn on **World
+advanced settings → Allow adopted assets outside the MJCF folder**. The export
+then copies those files and lists each one as a warning in `export_report.json`.
+The suffix and PNG checks still apply.
+
 Blender objects are often modelled with the origin at their base, while MuJoCo
 places a primitive at its centre. An adopted box, sphere, cylinder, capsule or
 ellipsoid whose object origin is elsewhere keeps that offset: the untouched geom

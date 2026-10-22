@@ -47,18 +47,36 @@ def check_paths(path):
     assert len(root.findall(".//geom[@type='plane']")) == 1
 
 
+def adopt_variant(xml):
+    """Adopt ``xml`` and export into ``shared``.
+
+    realistic/scene.xml names ../scene_assets, the room's own library outside
+    its folder. Exporting into another shared folder copies those files, which
+    needs the opt-in.
+    """
+    adopt_mjcf(bpy.context, str(xml))
+    settings = bpy.context.scene.mujoco_world
+    settings.asset_directory = str(shared)
+    settings.allow_outside_assets = xml.parent != room
+
+
+def check_outside_notes(report, xml):
+    """Only the realistic variant copies files from outside its folder, each with a note."""
+    notes = [w for w in report["warnings"] if "from outside the adopted world's folder" in w]
+    assert bool(notes) == (xml.parent != room), (xml, notes)
+
+
 counts = []
 for repetition in range(2):
     for blend, xml, target in variants:
         bpy.ops.wm.open_mainfile(filepath=str(blend))
-        adopt_mjcf(bpy.context, str(xml))
+        adopt_variant(xml)
         scene = bpy.context.scene
-        scene.mujoco_world.asset_directory = str(shared)
         # Exercise the internal temporary ordinary-export path too.
         bpy.ops.mesh.primitive_cube_add(size=0.1, location=(10, 10, 1))
         prop = bpy.context.object
         prop.name, prop.mujoco_world.role = "Shared_export_added_prop", "FREE"
-        export_world(bpy.context, str(target))
+        check_outside_notes(export_world(bpy.context, str(target)), xml)
         assert scene.mujoco_world.asset_directory == str(shared)
         check_paths(target)
     counts.append(len(list(shared.iterdir())))
@@ -116,8 +134,7 @@ def referenced(path):
 def export_variant(variant, edit=False):
     blend, xml, target = variant
     bpy.ops.wm.open_mainfile(filepath=str(blend))
-    adopt_mjcf(bpy.context, str(xml))
-    bpy.context.scene.mujoco_world.asset_directory = str(shared)
+    adopt_variant(xml)
     bpy.ops.mesh.primitive_cube_add(size=0.2 if edit else 0.1, location=(10, 10, 1))
     added = bpy.context.object
     added.name, added.mujoco_world.role = "Shared_export_added_prop", "FREE"

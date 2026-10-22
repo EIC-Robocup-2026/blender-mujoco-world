@@ -83,4 +83,9 @@ for name in ("assetdir", "strippath"):
     assert np.array_equal(export.tex_data, source.tex_data), name
 results["asset_dirs"] = {"textures": int(models["assetdir"].ntex), "hfields": int(models["assetdir"].nhfield)}
 
+# Opted-in outside textures and a variant's shared library load as textures.
+for name in ("outside_allowed", "outside_shared_library"):
+    assert models[name].ntex == 1, (name, models[name].ntex)
+results["outside_assets"] = {name: int(models[name].ntex) for name in ("outside_allowed", "outside_shared_library")}
+
 print("FOLLOWUP_FIXES_PHYSICS_OK", json.dumps(results))

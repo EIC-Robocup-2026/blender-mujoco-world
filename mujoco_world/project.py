@@ -66,6 +66,12 @@ _AXES = {"x": (1, 0, 0), "y": (0, 1, 0), "z": (0, 0, 1)}
 _ELONGATED = {"capsule", "cylinder", "box", "ellipsoid"}
 # Attributes naming asset files: one file, or the six faces of a cube texture.
 _FILE_FIELDS = ("file", "fileright", "fileleft", "fileup", "filedown", "filefront", "fileback")
+# Source files an adopted export copies, by element, with the suffixes MuJoCo
+# reads for it. Source mesh files are never read or copied: every mesh is
+# regenerated from Blender geometry, so their paths are only protected.
+_COPIED_SUFFIXES = {"texture": (".png",), "hfield": (".png", ".bin"), "skin": (".skn",)}
+_PNG_SIGNATURE = b"\x89PNG\r\n\x1a\n"
+_OUTSIDE_SETTING = "Allow adopted assets outside the MJCF folder"
 
 
 def _floats(attrs, field, count=None):
@@ -1113,27 +1119,67 @@ def _build_adopted(context, path, root, compiler, asset, source, directories, ob
             return Path(filename)
         directory = meshdir if element.tag in {"mesh", "hfield", "skin"} else texturedir if element.tag == "texture" else ""
         return source.parent / directory / filename
+    source_root = source.parent.resolve()
+    def checked_file(element, field):
+        """The resolved source file ``element`` names in ``field``, once it is safe to copy.
+
+        The MJCF names these paths, and the export copies the files into the
+        asset folder, so an absolute or '..' path from someone else's world
+        could otherwise copy any local file there. A file must therefore have a
+        suffix MuJoCo reads for the element, PNG content when it is a .png,
+        and lie, after following links, inside the adopted world's folder or
+        the export's asset folder (whose files are already part of the export).
+        The scene setting allow_outside_assets allows other folders, with a
+        warning per file.
+        """
+        value = element.get(field)
+        label = f"Adopted {element.tag} '{element.get('name', '<unnamed>')}', {field}=\"{value}\""
+        suffixes = _COPIED_SUFFIXES.get(element.tag)
+        if suffixes is None:
+            raise ExportError(f"{label}: an adopted export copies only texture, height field and skin files. "
+                              f"Remove this <{element.tag}> from the source MJCF and adopt it again.")
+        original = source_file(element, field)
+        if original.suffix.lower() not in suffixes:
+            raise ExportError(f"{label}: a {element.tag} file must end in {' or '.join(suffixes)}.")
+        resolved = original.resolve()
+        if not (resolved.is_relative_to(source_root) or resolved.is_relative_to(assets.directory)):
+            if not settings.allow_outside_assets:
+                raise ExportError(f"{label}: the file {resolved} is outside the adopted world's folder {source_root}. "
+                                  "A crafted MJCF can name any local file this way, and the export would copy it into the "
+                                  "asset folder. Move the file into the world's folder and adopt it again, or, if you "
+                                  f"trust this world, turn on '{_OUTSIDE_SETTING}' under World advanced settings.")
+            warnings.append(f"{label}: copied {resolved} from outside the adopted world's folder {source_root}, "
+                            f"because '{_OUTSIDE_SETTING}' is on.")
+        if not resolved.is_file():
+            recorded = scene.get("mjworld_mjcf_source_absolute")
+            where = str(source) + (f" (adopted from {recorded})" if recorded and Path(recorded) != source else "")
+            raise ExportError(f"Missing adopted asset: {original}. Asset files are read beside the adopted MJCF world, "
+                              f"{where}; keep them there, or adopt the world again from where it is now.")
+        if original.suffix.lower() == ".png":
+            with open(resolved, "rb") as stream:
+                if stream.read(len(_PNG_SIGNATURE)) != _PNG_SIGNATURE:
+                    raise ExportError(f"{label}: {resolved} is not a PNG file.")
+        return resolved
     file_elements = list(asset) + root.findall("./deformable/skin")
-    # An export may target the source world's own folder; its files are never removed.
+    # Every file is checked before any is copied, so a refused export leaves
+    # the asset folder unchanged. An export may target the source world's own
+    # folder; its files are never removed.
+    copied = {}
     for element in file_elements:
         for field in _FILE_FIELDS:
             if element.get(field):
                 assets.protect(source_file(element, field))
+                if element.tag != "mesh":
+                    copied[element, field] = checked_file(element, field)
     def copy_files(element, fallback):
         for field in _FILE_FIELDS:
             filename = element.get(field)
             if not filename:
                 continue
-            original = source_file(element, field)
-            if not original.exists():
-                recorded = scene.get("mjworld_mjcf_source_absolute")
-                where = str(source) + (f" (adopted from {recorded})" if recorded and Path(recorded) != source else "")
-                raise ExportError(f"Missing adopted asset: {original}. Asset files are read beside the adopted MJCF world, "
-                                  f"{where}; keep them there, or adopt the world again from where it is now.")
             # Cube texture faces keep the texture's name with the face appended.
             side = "" if field == "file" else "_" + field[len("file"):]
             name = slug(element.get("name", fallback)) + side + Path(filename).suffix.lower()
-            element.set(field, asset_prefix + "/" + assets.copy(original, name))
+            element.set(field, asset_prefix + "/" + assets.copy(copied[element, field], name))
         if element.tag == "texture" and element.get("colorspace") is None and any(element.get(f) for f in _FILE_FIELDS):
             # MuJoCo's 'auto' reads the PNG's sRGB chunk, which Blender 5.2
             # and many editors write when the file is saved again. Pin the

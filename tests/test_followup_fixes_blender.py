@@ -709,6 +709,95 @@ def asset_folder_links():
     return {"linked": linked, "edited": edited, "removed": unchanged, "replaced": kept, "content_named": name}
 
 
+OUTSIDE_WORLD = """<mujoco model="outside_assets">
+  <compiler angle="radian"/>
+  <asset>
+    {assets}
+    <material name="crate_mat" texture="crate_tex"/>
+  </asset>
+  <worldbody>
+    <geom name="floor" type="plane" size="5 5 0.1"/>
+    <geom name="Crate" type="box" size="0.2 0.2 0.2" pos="0 0 0.2" material="crate_mat"/>
+  </worldbody>{extra}
+</mujoco>
+"""
+
+
+def adopt_outside(directory, assets, extra="", name="world.xml"):
+    """Adopt a one-crate world whose asset block is ``assets``; return its path."""
+    directory.mkdir(parents=True, exist_ok=True)
+    source = directory / name
+    source.write_text(OUTSIDE_WORLD.format(assets=assets, extra=extra), encoding="utf-8")
+    fresh_scene()
+    floor()
+    box("Crate", (0, 0, 0.2), (0.2, 0.2, 0.2))
+    adopt_mjcf(bpy.context, str(source))
+    return source
+
+
+@section
+def outside_assets():
+    """Adopted file paths outside the world's folder are refused unless allowed; suffixes and PNG content are checked."""
+    directory = OUT / "outside_assets"
+    secret = directory / "elsewhere" / "secret.png"
+    png(secret, rgb=(10, 200, 30))
+    messages = {}
+    linked = directory / "linked" / "tex" / "crate.png"
+    linked.parent.mkdir(parents=True)
+    linked.symlink_to(secret)
+    cases = {"absolute": (directory / "absolute", f'file="{secret}"'),
+             "parent": (directory / "parent", 'file="../elsewhere/secret.png"'),
+             "link": (directory / "linked", 'file="tex/crate.png"')}
+    for label, (source_dir, attribute) in cases.items():
+        adopt_outside(source_dir, f'<texture name="crate_tex" type="2d" {attribute}/>')
+        refused = directory / f"refused_{label}" / "scene.xml"
+        message = expect_error(f"Adopted texture 'crate_tex', {attribute}: the file {secret}",
+                               lambda refused=refused: export(refused))
+        assert "outside the adopted world's folder" in message and "Allow adopted assets outside the MJCF folder" in message
+        assert not refused.parent.exists() or not any(refused.parent.rglob("*.png")), "a refused file was copied"
+        messages[label] = message
+    # With the opt-in the file is copied, with a warning that names it.
+    adopt_outside(directory / "absolute", f'<texture name="crate_tex" type="2d" file="{secret}"/>')
+    bpy.context.scene.mujoco_world.allow_outside_assets = True
+    allowed = directory / "allowed" / "scene.xml"
+    report = export(allowed, "outside_allowed")
+    notes = [w for w in report["warnings"] if "from outside the adopted world's folder" in w]
+    assert len(notes) == 1 and str(secret) in notes[0], report["warnings"]
+    texture = next(xml(allowed).iter("texture"))
+    assert (allowed.parent / texture.get("file")).read_bytes() == secret.read_bytes(), texture.attrib
+    # A file already in the export's asset folder is part of the export: the
+    # layout of a variant naming ../scene_assets, its shared library.
+    library = directory / "variants" / "scene_assets"
+    png(library / "crate_tex.png", rgb=(200, 20, 20))
+    adopt_outside(directory / "variants" / "baked", '<texture name="crate_tex" type="2d" file="../scene_assets/crate_tex.png"/>')
+    bpy.context.scene.mujoco_world.asset_directory = str(library)
+    variant = directory / "variants" / "baked" / "scene.xml"
+    report = export(variant, "outside_shared_library")
+    assert not any("from outside the adopted world's folder" in w for w in report["warnings"]), report["warnings"]
+    assert next(xml(variant).iter("texture")).get("file") == "../scene_assets/crate_tex.png"
+    # Suffixes follow the element, and a .png must hold PNG data. These checks
+    # apply with the opt-in too.
+    (directory / "types").mkdir()
+    (directory / "types" / "notes.txt").write_text("not an image\n")
+    (directory / "types" / "fake.png").write_text("not an image\n")
+    (directory / "types" / "body.obj").write_text(CUBE_OBJ)
+    png(directory / "types" / "crate.png")
+    crate = '<texture name="crate_tex" type="2d" file="crate.png"/>'
+    refusals = {"suffix": ('<texture name="crate_tex" type="2d" file="notes.txt"/>', "", 'file="notes.txt": a texture file must end in .png'),
+                "content": ('<texture name="crate_tex" type="2d" file="fake.png"/>', "", "fake.png is not a PNG file"),
+                "skin": (crate, '\n  <deformable><skin name="cover" file="body.obj"/></deformable>',
+                         "Adopted skin 'cover', file=\"body.obj\": a skin file must end in .skn"),
+                "element": (crate + '\n    <model name="extra" file="body.obj"/>', "",
+                            "copies only texture, height field and skin files")}
+    for label, (assets_block, extra, fragment) in refusals.items():
+        adopt_outside(directory / "types", assets_block, extra, name=f"{label}.xml")
+        bpy.context.scene.mujoco_world.allow_outside_assets = True
+        refused = directory / f"refused_{label}" / "scene.xml"
+        messages[label] = expect_error(fragment, lambda refused=refused: export(refused))
+        assert not refused.exists(), refused
+    return messages
+
+
 @section
 def asset_dirs():
     """assetdir, texturedir precedence, strippath, cube texture faces and height fields resolve like MuJoCo."""
