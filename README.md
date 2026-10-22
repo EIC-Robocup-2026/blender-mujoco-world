@@ -230,7 +230,7 @@ copied file must:
 
 - lie, after following symbolic links, inside the adopted XML's folder or inside
   the export's asset folder (a variant that names its shared library, such as
-  `realistic/scene.xml` naming `../scene_assets`, passes when that library is
+  `baked/scene.xml` naming `../scene_assets`, passes when that library is
   the **Shared asset folder**);
 - end in a suffix MuJoCo reads for its element: `.png` for textures, `.png` or
   `.bin` for height fields, `.skn` for skins; a `.png` must hold PNG data.

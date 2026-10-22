@@ -19,9 +19,12 @@
 #   MJWORLD_ALLOW_WALKIE_SKIP
 #                      Set to 1 to report an unusable loader as SKIP instead.
 #   MJWORLD_ROOM_ROOT  Optional existing room project (scene.xml,
-#                      chula_pat14_6.blend, realistic/scene.xml,
-#                      realistic/realistic.blend). The tests use a copy in
-#                      OUTPUT_DIR and check that the copy is left unchanged.
+#                      chula_pat14_6.blend, and baked/scene.xml with
+#                      baked/baked.blend or realistic/scene.xml with
+#                      realistic/realistic.blend), such as
+#                      simulation/mujoco/worlds/chula_pat14_6 in walkie-ros.
+#                      The tests use a copy in OUTPUT_DIR and check that the
+#                      copy is left unchanged.
 set -euo pipefail
 
 TESTS="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"

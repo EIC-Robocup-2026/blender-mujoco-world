@@ -62,15 +62,23 @@ reads that folder.
 | `review_fixes` | `test_review_fixes_blender.py` | `validate_review_fixes.py` | Metal and emission in the bake, metal inside node groups and Metallic BSDFs, light and shadow linking of bake clones, atlas coverage of renamed and copied sources, the pinned lightmap profile, stale bake marks, bake failure cleanup, restore edge cases, faceless meshes, clone shading inputs, the bake's early checks, render-active UV maps, 16-bit/float/UDIM/missing/Non-Color images, 16-bit PNG and EXR emission in ordinary and adopted worlds, both texture colour modes, adopted texture colour spaces, the operators' linked-data, restore and error handling. |
 | `followup` | `test_followup_fixes_blender.py` | `validate_followup_fixes.py` | Stretched capsules, rejected `<frame>` and `<replicate>`, slide, ball and untyped joints, class-typed geoms, contact classes on moved geoms, body and geom maps, colliding and non-ASCII mesh names, origin offsets, notes for curves and instances, volume-weighted mass, a moved blend file, stale-file cleanup, symbolic links in asset folders, adopted asset paths outside the world's folder and their suffix and PNG checks, asset directories with cube textures and height fields, rebake names, adopted doors oriented by `euler` and `xyaxes` with a new starting angle, layered materials after removing another material, asset files of one name (a texture and a height field, names that slug alike) in both folder modes, repeated registration. |
 | `room_compound` | `test_compound_blender.py` with `MJCF BLEND` | `validate_compound.py` | Adoption and edits of the existing room project, exported into a shared asset folder inside the output. |
-| `shared_assets` | `test_shared_assets_blender.py` | `validate_compile.py shared_assets` | Both variants of the room project exported twice into one shared asset folder; the realistic variant's `../scene_assets` files need the outside-assets opt-in there. |
+| `shared_assets` | `test_shared_assets_blender.py` | `validate_compile.py shared_assets` | Both variants of the room project exported twice into one shared asset folder; the second variant's `../scene_assets` files need the outside-assets opt-in there. |
 | `room_project_unchanged` | | `diff -r` | The room tests left the project copy unchanged. |
 | `package_reproducible` | | `package_addon.py`, `cmp`, `check_package.py` | Two builds of the ZIP are byte-identical. It holds exactly the tracked add-on modules plus `README.md` and `LICENSE`, sorted, with fixed timestamps, `rw-r--r--` permissions and deflate compression. |
 | `install_check` | `install_check.py` | | The ZIP installs into a sandboxed user directory, registers its operators, panel and File > Export entry, exports a world, and disables and re-enables cleanly. |
 | `source_tree_unchanged` | | `git status --ignored` | No step wrote into the checkout, ignored files included. |
 
-The room tests expect the layout of the project they were written for:
-`scene.xml` and `chula_pat14_6.blend` at the top, `realistic/scene.xml` and
-`realistic/realistic.blend` below, and an object named `task_apple_1_00`.
+The room tests expect the layout of the Chula PAT14-6 room: `scene.xml` and
+`chula_pat14_6.blend` at the top, a second variant below in either
+`baked/scene.xml` and `baked/baked.blend` or `realistic/scene.xml` and
+`realistic/realistic.blend`, and an object named `task_apple_1_00`. The room in
+walkie-ros has this layout:
+
+```bash
+MJWORLD_ROOM_ROOT=/path/to/walkie-ros/simulation/mujoco/worlds/chula_pat14_6 \
+    BLENDER=/path/to/blender PYTHON=/tmp/mujoco-world-venv/bin/python tests/run_all.sh
+```
+
 Without `MJWORLD_ROOM_ROOT` they are skipped.
 
 ## Run one test

@@ -6,10 +6,12 @@ Run:
 Then compile the written worlds with MuJoCo:
   python tests/validate_compile.py shared_assets OUTPUT_DIR
 
-ROOM_ROOT is a room project with scene.xml and chula_pat14_6.blend, and
-realistic/scene.xml and realistic/realistic.blend; the test expects its
-task_apple_1_00 object. Pass a copy of the project: its blend files are
-opened but never saved, and every export goes to OUTPUT_DIR.
+ROOM_ROOT is a room project with scene.xml and chula_pat14_6.blend, and a
+second variant in baked/scene.xml and baked/baked.blend (the layout of
+simulation/mujoco/worlds/chula_pat14_6 in walkie-ros) or in
+realistic/scene.xml and realistic/realistic.blend (the original project); the
+test expects its task_apple_1_00 object. Pass a copy of the project: its
+blend files are opened but never saved, and every export goes to OUTPUT_DIR.
 """
 import json
 import hashlib
@@ -29,8 +31,11 @@ from mujoco_world.project import adopt_mjcf  # noqa: E402
 
 room = Path(args[0]).resolve()
 shared = output / "scene_assets"
+second = next((name for name in ("baked", "realistic") if (room / name / f"{name}.blend").is_file()), None)
+if second is None:
+    raise SystemExit(f"{room} has neither baked/baked.blend nor realistic/realistic.blend")
 variants = [(room / "chula_pat14_6.blend", room / "scene.xml", output / "scene.xml"),
-            (room / "realistic/realistic.blend", room / "realistic/scene.xml", output / "realistic/scene.xml")]
+            (room / second / f"{second}.blend", room / second / "scene.xml", output / second / "scene.xml")]
 
 
 def check_paths(path):
@@ -50,8 +55,8 @@ def check_paths(path):
 def adopt_variant(xml):
     """Adopt ``xml`` and export into ``shared``.
 
-    realistic/scene.xml names ../scene_assets, the room's own library outside
-    its folder. Exporting into another shared folder copies those files, which
+    The second variant's scene.xml names ../scene_assets, the room's own
+    library outside its folder. Exporting into another shared folder copies those files, which
     needs the opt-in.
     """
     adopt_mjcf(bpy.context, str(xml))
@@ -61,7 +66,7 @@ def adopt_variant(xml):
 
 
 def check_outside_notes(report, xml):
-    """Only the realistic variant copies files from outside its folder, each with a note."""
+    """Only the second variant copies files from outside its folder, each with a note."""
     notes = [w for w in report["warnings"] if "from outside the adopted world's folder" in w]
     assert bool(notes) == (xml.parent != room), (xml, notes)
 
