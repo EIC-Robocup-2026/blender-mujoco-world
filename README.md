@@ -54,7 +54,7 @@ Exporting `<name>.xml` writes these files:
 | --- | --- | --- |
 | `<name>.xml` | every export | The MuJoCo world. Asset paths are relative to it. |
 | `<name>_assets/` beside the XML, or the **Shared asset folder** | every export | OBJ meshes and PNG textures the world references. See [Share assets between variants](#share-assets-between-variants). |
-| `<name>_assets/.mujoco_world_manifest.json` | exports into the per-XML asset folder | The files this world wrote, so the next export can remove the ones it no longer writes. A shared folder gets no manifest. |
+| `<name>_assets/.mujoco_world_manifest.json` | exports into the per-XML asset folder | The files this world wrote and their SHA-256 digests, so the next export can remove the unchanged ones it no longer writes. A shared folder gets no manifest. |
 | `export_report.json` beside the XML | every export | Add-on and Blender versions, object and triangle counts, the floor plane, the texture mode, per-object details and every note or warning. |
 | `OPEN_WORLD.txt` beside the XML | exports of new (not adopted) worlds | How to open the world in MuJoCo's viewer and what it does not contain. |
 
@@ -320,10 +320,15 @@ references the old file still loads it unchanged. Files no world uses any more
 are not deleted automatically.
 
 The usual per-XML asset folder belongs to one world. The export lists the files
-it wrote in `.mujoco_world_manifest.json` inside that folder, and the next export
-removes listed files it no longer writes, such as the mesh of a renamed or
-deleted object. Files the manifest does not list are left alone, so stale files
-from an export made before the manifest existed stay until you delete them.
+it wrote, with their SHA-256 digests, in `.mujoco_world_manifest.json` inside
+that folder, and the next export removes listed files it no longer writes, such
+as the mesh of a renamed or deleted object. A listed file is removed only when
+it is still a regular file with the recorded content. A file you edited since,
+a file the manifest does not list, and a symbolic link (and whatever it points
+to) are left alone, so stale files from an export made before the manifest
+recorded digests stay until you delete them. No export writes through a
+symbolic link: a per-XML export replaces a link at a name it writes with its own
+file, and in a shared folder a link counts as a taken name.
 
 ## Development
 

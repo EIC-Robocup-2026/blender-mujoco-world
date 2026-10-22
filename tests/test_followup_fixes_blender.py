@@ -10,6 +10,7 @@ Every scene is generated here; nothing outside OUTPUT_DIR is written. Each
 section runs even when an earlier one fails, and the run fails at the end
 with every failing section listed.
 """
+import hashlib
 import importlib
 import json
 from pathlib import Path
@@ -627,11 +628,15 @@ def manifest_cleanup():
     outside = directory / "outside.txt"
     outside.write_text("kept")
     manifest = assets / ".mujoco_world_manifest.json"
-    recorded = json.loads(manifest.read_text())["files"]
+    record = json.loads(manifest.read_text())
+    recorded = record["files"]
     first = sorted(p.name for p in assets.iterdir() if p.name != manifest.name and p != foreign)
     assert recorded == first, (recorded, first)
+    assert record["sha256"] == {name: hashlib.sha256((assets / name).read_bytes()).hexdigest() for name in first}
     # Only plain file names in the manifest are trusted.
-    manifest.write_text(json.dumps({"files": recorded + ["../outside.txt", ".hidden"]}))
+    record["files"] = recorded + ["../outside.txt", ".hidden"]
+    record["sha256"].update({"../outside.txt": hashlib.sha256(b"kept").hexdigest()})
+    manifest.write_text(json.dumps(record))
     bpy.data.objects.remove(bpy.context.scene.objects["Crate_0"])
     bpy.context.scene.objects["Crate_2"].name = "Crate_two"
     export(target, "manifest")
@@ -642,6 +647,66 @@ def manifest_cleanup():
     assert json.loads(manifest.read_text())["files"] == referenced
     assert foreign.exists() and outside.exists()
     return {"first": first, "second": referenced}
+
+
+@section
+def asset_folder_links():
+    """Stale-file cleanup and asset writes never follow a link out of the asset folder."""
+    directory = OUT / "asset_links"
+    library = directory / "library"
+    library.mkdir(parents=True)
+    targets = {name: library / f"{name}.obj" for name in ("stale_link", "written_link", "xml_temporary", "dangling")}
+    for name in ("stale_link", "written_link", "xml_temporary"):
+        targets[name].write_text(f"library file {name}\n")
+    library_bytes = {name: path.read_bytes() for name, path in targets.items() if path.exists()}
+    fresh_scene()
+    for i in range(4):
+        box(f"Crate_{i}", (i, 0, 0.2), (0.2, 0.2, 0.2), role="FREE")
+    target = directory / "scene.xml"
+    export(target)
+    assets = directory / "scene_assets"
+    manifest = assets / ".mujoco_world_manifest.json"
+    record = json.loads(manifest.read_text())
+    assert len(record["files"]) == 4, record
+    # Crate_0 keeps its file name; the other crates' files become stale.
+    kept, linked, edited, unchanged = record["files"]
+    # A link named like a manifest entry, whose recorded digest even matches
+    # the outside file it points to: removing it must not touch that file.
+    (assets / linked).unlink()
+    (assets / linked).symlink_to(targets["stale_link"])
+    record["sha256"][linked] = hashlib.sha256(library_bytes["stale_link"]).hexdigest()
+    manifest.write_text(json.dumps(record))
+    (assets / edited).write_text("edited by hand\n")
+    # The next export writes this name again; it is a link to an outside file now.
+    (assets / kept).unlink()
+    (assets / kept).symlink_to(targets["written_link"])
+    # The old fixed temporary name of the XML writer, planted as a link.
+    planted = directory / ".scene.xml.mjworld-tmp"
+    planted.symlink_to(targets["xml_temporary"])
+    for i in range(1, 4):
+        bpy.data.objects.remove(bpy.context.scene.objects[f"Crate_{i}"])
+    export(target, "asset_links")
+    assert {name: path.read_bytes() for name, path in targets.items() if path.exists()} == library_bytes
+    assert (assets / linked).is_symlink(), "the stale link itself is left alone"
+    assert (assets / edited).read_text() == "edited by hand\n", "a file edited since the export is kept"
+    assert not (assets / unchanged).exists(), "an unchanged stale file is removed"
+    assert (assets / kept).is_file() and not (assets / kept).is_symlink(), "a written name replaces the link"
+    assert planted.is_symlink() and ET.parse(target).getroot().tag == "mujoco"
+    after = json.loads(manifest.read_text())
+    assert after["files"] == [kept], after
+    # A shared folder never creates a file through a dangling link: the name
+    # counts as taken, and the asset gets a content name instead.
+    shared = directory / "shared"
+    shared.mkdir()
+    (shared / "dangling.obj").symlink_to(targets["dangling"])
+    writer = exporter.AssetWriter(shared, shared=True)
+    try:
+        name = writer.write("dangling.obj", lambda path: path.write_text("new mesh\n"))
+    finally:
+        writer.close()
+    assert name.startswith("mesh_") and (shared / name).read_text() == "new mesh\n", name
+    assert not targets["dangling"].exists() and (shared / "dangling.obj").is_symlink()
+    return {"linked": linked, "edited": edited, "removed": unchanged, "replaced": kept, "content_named": name}
 
 
 @section

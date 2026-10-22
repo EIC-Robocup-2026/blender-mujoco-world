@@ -7,13 +7,14 @@ import os
 from array import array
 from pathlib import Path
 import re
+import secrets
 import shutil
 import struct
 import tempfile
 import xml.etree.ElementTree as ET
 
 import bpy
-from mathutils import Matrix, Vector
+from mathutils import Vector
 
 
 class ExportError(ValueError):
@@ -540,8 +541,29 @@ def _content_name(path, data):
     return label + "_" + hashlib.sha256(data).hexdigest()[:24] + path.suffix.lower()
 
 
+def file_digest(path):
+    """SHA-256 hex digest of the file at ``path``."""
+    digest = hashlib.sha256()
+    with open(path, "rb") as stream:
+        for block in iter(lambda: stream.read(1 << 20), b""):
+            digest.update(block)
+    return digest.hexdigest()
+
+
+def _holds(path, data):
+    """Whether ``path`` is a readable file whose bytes are ``data``."""
+    try:
+        return path.is_file() and path.read_bytes() == data
+    except OSError:
+        return False
+
+
 class AssetWriter:
     """Writes the mesh and texture files of one export.
+
+    Files are addressed by name inside the resolved folder. A file name is
+    never resolved, so a symbolic link in the folder is replaced or left alone,
+    never written through or removed together with its target.
 
     A shared folder holds files that other exported worlds reference, so a
     shared export never changes an existing file. Index-named files (the
@@ -551,39 +573,54 @@ class AssetWriter:
 
     A per-XML folder belongs to one world. Its files are staged and replace the
     previous export's files only in commit(), so a failed export leaves the
-    previous output intact. The folder's manifest (MANIFEST) lists the files
-    the last export wrote; commit() removes those the new export no longer
-    writes, so renamed or deleted objects leave no stale files. Only files a
-    manifest lists or this export wrote are ever removed, never a protected
-    source file. A shared folder has no manifest: other worlds may still use
-    any of its files.
+    previous output intact. The folder's manifest (MANIFEST) records the name
+    and SHA-256 digest of every file the last export wrote; commit() removes
+    those the new export no longer writes, so renamed or deleted objects leave
+    no stale files. A stale file is removed only when it is a regular file
+    directly in the folder whose content still matches its recorded digest:
+    files the manifest does not list, files edited since, symbolic links (and
+    whatever they point to) and protected source files are kept. A shared
+    folder has no manifest: other worlds may still use any of its files.
     """
 
     MANIFEST = ".mujoco_world_manifest.json"
 
     def __init__(self, directory, shared):
-        self.directory = Path(directory)
+        self.directory = Path(directory).resolve()
         self.shared = shared
         self.written = set()
         self._staged = {}
-        self._remove = set()
         self._protected = set()
         self._stage = None
-        self._previous = set() if shared else self._read_manifest()
+        self._previous = {} if shared else self._read_manifest()
+
+    def _entry(self, path):
+        """``path`` with its folder resolved but its file name kept, so a link is not followed."""
+        path = Path(path)
+        return path.parent.resolve() / path.name
 
     def _read_manifest(self):
-        """Files the previous export into this per-XML folder wrote."""
+        """Name and recorded digest of each file the previous export into this folder wrote.
+
+        A name without a digest maps to None; such a file is never removed.
+        """
         try:
-            names = json.loads((self.directory / self.MANIFEST).read_text(encoding="utf-8")).get("files", [])
+            manifest = json.loads((self.directory / self.MANIFEST).read_text(encoding="utf-8"))
+            names, digests = manifest.get("files", []), manifest.get("sha256", {})
         except (OSError, ValueError, AttributeError):
-            return set()
+            return {}
+        if not isinstance(names, list):
+            return {}
+        if not isinstance(digests, dict):
+            digests = {}
         # Only plain file names directly inside the folder; anything else is ignored.
-        return {(self.directory / name).resolve() for name in names
-                if isinstance(name, str) and name and name == Path(name).name and not name.startswith(".")}
+        return {name: digests[name] if isinstance(digests.get(name), str) else None for name in names
+                if isinstance(name, str) and name and name == Path(name).name and not name.startswith(".")
+                and "\\" not in name}
 
     def protect(self, path):
-        """Never remove ``path`` (an adopted world's own source asset)."""
-        self._protected.add(Path(path).resolve())
+        """Never remove ``path`` (an adopted world's own source asset), nor the file it links to."""
+        self._protected.update({self._entry(path), Path(path).resolve()})
 
     def _staging(self):
         if self._stage is None:
@@ -593,16 +630,20 @@ class AssetWriter:
     def _place(self, target, source, *, content_named, move):
         """Put ``source`` into the shared folder without changing existing files."""
         data = source.read_bytes()
-        if not content_named and (not target.exists() or target.read_bytes() == data):
+        # A dangling link counts as an existing file, so no file is created through it.
+        if not content_named and (not os.path.lexists(target) or _holds(target, data)):
             final = target
         else:
             final = target.parent / _content_name(target, data)
-        if not final.exists():
+        if not os.path.lexists(final):
             if move:
                 source.replace(final)
             else:
                 shutil.copyfile(source, final)
-        self.written.add(final.resolve())
+        elif not _holds(final, data):
+            raise ExportError(f"The shared asset folder already has '{final.name}' with other content, and an export never "
+                              "changes a file there. Remove or rename that file, then export again.")
+        self.written.add(final)
         return final.name
 
     def write(self, filename, writer, *, content_named=False):
@@ -611,8 +652,8 @@ class AssetWriter:
         if not self.shared:
             staged = self._staging() / filename
             writer(staged)
-            self._staged[target.resolve()] = staged
-            self.written.add(target.resolve())
+            self._staged[target] = staged
+            self.written.add(target)
             return filename
         with tempfile.TemporaryDirectory(prefix=".mjworld-", dir=self.directory) as temporary:
             working = Path(temporary) / filename
@@ -629,31 +670,52 @@ class AssetWriter:
         return self._place(target, Path(source), content_named=False, move=False)
 
     def discard(self, path):
-        """Drop an asset that ended up unreferenced, if this export wrote it."""
-        path = Path(path).resolve()
+        """Drop an asset that ended up unreferenced, if this export wrote it.
+
+        The previous export's file of that name then counts as stale.
+        """
+        path = self._entry(path)
         if self.shared or path not in self.written or path in self._protected:
             return
         self._staged.pop(path, None)
         self.written.discard(path)
-        self._remove.add(path)
+
+    def _stale(self, name, digest):
+        """The previous export's file ``name`` if it may be removed, else None."""
+        path = self.directory / name
+        if digest is None or path.parent != self.directory or path in self._protected:
+            return None
+        try:
+            # A link is never removed, and neither is the file it points to.
+            if path.is_symlink() or not path.is_file() or path.resolve() in self._protected:
+                return None
+            # A file edited since the export wrote it is the user's now.
+            return path if file_digest(path) == digest else None
+        except OSError:
+            return None
 
     def commit(self):
-        """Move staged files into place, remove discarded and stale ones, and record the manifest."""
+        """Move staged files into place, remove stale ones, and record the manifest."""
+        digests = {}
         for target, staged in self._staged.items():
+            digests[target.name] = file_digest(staged)
+            # Replacing the name replaces a link there, never the file it points to.
             os.replace(staged, target)
         self._staged.clear()
-        stale = set() if self.shared else self._previous - self.written
-        for path in (self._remove | stale) - self._protected:
-            path.unlink(missing_ok=True)
-        self._remove.clear()
         manifest = self.directory / self.MANIFEST
         if self.shared:
             # A folder that became shared no longer belongs to one world.
             manifest.unlink(missing_ok=True)
             return
-        files = sorted(path.name for path in self.written if path.parent == self.directory.resolve())
-        _replace_file(manifest, lambda target: target.write_text(json.dumps({"files": files}, indent=1) + "\n", encoding="utf-8"))
-        self._previous = set(self.written)
+        files = sorted(path.name for path in self.written if path.parent == self.directory)
+        for name, digest in self._previous.items():
+            if name not in files:
+                path = self._stale(name, digest)
+                if path is not None:
+                    path.unlink(missing_ok=True)
+        record = {"files": files, "sha256": {name: digests[name] for name in files}}
+        _replace_file(manifest, lambda target: target.write_text(json.dumps(record, indent=1) + "\n", encoding="utf-8"))
+        self._previous = dict(record["sha256"])
 
     def close(self):
         if self._stage is not None:
@@ -661,13 +723,33 @@ class AssetWriter:
             self._stage = None
 
 
+def _new_sibling(path):
+    """Create an empty file beside ``path`` under a new random name; return its path.
+
+    O_EXCL never opens an existing name, a link included, so a link planted
+    under a predictable name cannot redirect the write. Unlike mkstemp, the
+    file gets the usual permissions (0o666 less the umask).
+    """
+    for _attempt in range(100):
+        temporary = path.with_name(f".{path.name}.{secrets.token_hex(6)}.mjworld-tmp")
+        try:
+            os.close(os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o666))
+        except FileExistsError:
+            continue
+        return temporary
+    raise ExportError(f"Could not create a temporary file beside {path}.")
+
+
 def _replace_file(path, write):
-    """Write ``path`` through a sibling temporary file, so a failure keeps the old file."""
+    """Write ``path`` through a new sibling temporary file, so a failure keeps the old file.
+
+    Replacing ``path`` replaces a link there, not the file it points to.
+    """
     path = Path(path)
-    temporary = path.with_name("." + path.name + ".mjworld-tmp")
+    temporary = _new_sibling(path)
     try:
         write(temporary)
-        if path.exists():
+        if path.is_file() and not path.is_symlink():
             shutil.copymode(path, temporary)
         os.replace(temporary, path)
     finally:
