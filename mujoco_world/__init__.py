@@ -2,13 +2,23 @@
 
 bl_info = {
     "name": "MuJoCo World — Easy Export",
-    "author": "Walkie / Codex",
+    "author": "Walkie contributors",
     "version": (0, 2, 0),
     "blender": (4, 2, 0),
     "location": "3D View > Sidebar > MuJoCo",
     "description": "Make fixed furniture, movable objects, doors and a plane floor; export a portable MuJoCo world",
     "category": "Import-Export",
 }
+
+if "bpy" in locals():
+    # Reload Scripts runs this file again in the same namespace, but not the
+    # submodules, which the operators import lazily. Refresh those as well.
+    import importlib
+    import sys
+    for _name in ("authored_materials", "exporter", "project", "baking"):
+        _module = sys.modules.get(f"{__name__}.{_name}")
+        if _module is not None:
+            importlib.reload(_module)
 
 import traceback
 
@@ -277,7 +287,13 @@ class MJWORLD_OT_adopt(Operator, ImportHelper):
             return {"CANCELLED"}
         except Exception as exc:
             return _report_failure(self, exc)
-        self.report({"INFO"}, f"Linked {report['bodies']} bodies and {report['geoms']} analytic/visual parts. Blender edits preserved.")
+        notes = report.get("warnings", [])
+        for note in notes[:10]:
+            self.report({"WARNING"}, note)
+        if len(notes) > 10:
+            self.report({"WARNING"}, f"{len(notes) - 10} more notes like these.")
+        self.report({"WARNING" if notes else "INFO"},
+                    f"Linked {report['bodies']} bodies and {report['geoms']} analytic/visual parts. Blender edits preserved.")
         return {"FINISHED"}
 
 
@@ -486,19 +502,26 @@ CLASSES = (MJWORLD_ObjectSettings, MJWORLD_SceneSettings, MJWORLD_OT_role, MJWOR
 
 
 def register():
+    # Each step tolerates an earlier register(), so a second call is harmless.
     for cls in CLASSES:
-        bpy.utils.register_class(cls)
+        if not cls.is_registered:
+            bpy.utils.register_class(cls)
     bpy.types.Object.mujoco_world = PointerProperty(type=MJWORLD_ObjectSettings, override=_OVR)
     bpy.types.Scene.mujoco_world = PointerProperty(type=MJWORLD_SceneSettings)
+    # remove() ignores a missing entry; it keeps the menu from listing the export twice.
+    bpy.types.TOPBAR_MT_file_export.remove(export_menu)
     bpy.types.TOPBAR_MT_file_export.append(export_menu)
 
 
 def unregister():
+    # Each step tolerates a partial or earlier unregister().
     bpy.types.TOPBAR_MT_file_export.remove(export_menu)
-    del bpy.types.Scene.mujoco_world
-    del bpy.types.Object.mujoco_world
+    for owner in (bpy.types.Scene, bpy.types.Object):
+        if hasattr(owner, "mujoco_world"):
+            del owner.mujoco_world
     for cls in reversed(CLASSES):
-        bpy.utils.unregister_class(cls)
+        if cls.is_registered:
+            bpy.utils.unregister_class(cls)
 
 
 if __name__ == "__main__":
