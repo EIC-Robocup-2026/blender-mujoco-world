@@ -20,6 +20,11 @@ def is_body(obj):
     return obj.type == "EMPTY" and (obj.mujoco_world.body or obj.get("simulation_body", False))
 
 
+def editable(obj):
+    """Whether edits to ``obj`` are kept: not linked from a library (overrides are editable)."""
+    return obj.library is None and obj.is_editable
+
+
 def body_owner(obj):
     parent = obj.parent
     while parent:
@@ -344,6 +349,10 @@ def group_selected(context, role="FREE"):
     objects = [o for o in context.selected_objects if o.type in {"MESH", "EMPTY"}]
     if not objects:
         raise ExportError("Select the visible parts and collision helpers to group.")
+    # Linked objects cannot be reparented: the change is lost when the file reloads.
+    objects = [o for o in objects if editable(o)]
+    if not objects:
+        raise ExportError("The selected parts are linked from another file. Make a library override first.")
     selected = set(objects)
     top = [o for o in objects if o.parent not in selected]
     parent = bpy.data.objects.new("Movable body" if role == "FREE" else "Door body" if role == "HINGE" else "Fixed body", None)
@@ -745,7 +754,8 @@ def export_adopted(context, filepath):
     or placed through an AssetWriter, and the XML and report replace the
     previous ones only at the end, so a failed export keeps the last good one.
     """
-    from .exporter import AssetWriter, ExportError, _asset_paths, write_text, write_xml, xml_path
+    from .baking import bake_covered
+    from .exporter import AssetWriter, ExportError, _asset_paths, skip_faceless, write_text, write_xml, xml_path
     if context.mode != "OBJECT":
         raise ExportError("Switch to Object Mode before exporting.")
     scene = context.scene
@@ -756,16 +766,21 @@ def export_adopted(context, filepath):
     unit = float(scene.unit_settings.scale_length)
     if unit <= 0:
         raise ExportError("Scene unit scale must be positive.")
-    objects = sorted({o for o in scene.objects if o.type == "MESH" and not o.get("mjworld_adopted_exclude") and _included(o) and (o.get("mjworld_mjcf_geom") or o.get("mjworld_baked_atlas") or (o.visible_get() and not o.hide_render))}, key=lambda o: o.name)
+    objects = sorted({o for o in scene.objects if o.type == "MESH" and not o.get("mjworld_adopted_exclude") and not o.get("mjworld_bake_clone") and _included(o) and (o.get("mjworld_mjcf_geom") or o.get("mjworld_baked_atlas") or (o.visible_get() and not o.hide_render))}, key=lambda o: o.name)
+    # Adopted mesh geoms keep their physics, so only new meshes may be skipped.
+    new, faceless_notes = skip_faceless(context, [o for o in objects if not o.get("mjworld_mjcf_geom")])
+    objects = [o for o in objects if o.get("mjworld_mjcf_geom") or o in new]
     if not objects:
         raise ExportError("No mesh objects selected for export.")
     adopted_bodies = [o for o in scene.objects if is_body(o) and o.get("mjworld_mjcf_body") and _included(o)]
     owners = {owner for obj in objects for owner in [body_owner(obj)] if owner}
     check_evaluated(context, objects + sorted(owners | set(adopted_bodies), key=lambda o: o.name))
     root = ET.fromstring(scene["mjworld_mjcf_template"])
+    # Bake sources whose appearance an atlas provides; see bake_covered().
+    covered = bake_covered(scene)
     def skipped(obj):
         # Bake sources that only provided appearance are replaced by the atlas.
-        return bool(obj.get("mjworld_bake_source") or obj.get("preserved_original_static_visual")) and obj.mujoco_world.role == "VISUAL"
+        return obj.name in covered and obj.mujoco_world.role == "VISUAL"
     fresh, unique = _adopted_copies(adopted_bodies, [o for o in objects if o.get("mjworld_mjcf_geom") and not skipped(o)], root)
     chains = _default_chains(root)
     source = _resolved_path(scene["mjworld_mjcf_source"])
@@ -778,13 +793,13 @@ def export_adopted(context, filepath):
     asset = root.find("asset")
     if asset is None:
         asset = ET.SubElement(root, "asset")
-    warnings = []
+    warnings = list(faceless_notes)
     path.parent.mkdir(parents=True, exist_ok=True)
     assets_path, asset_prefix, shared_assets = _asset_paths(scene, path)
     assets = AssetWriter(assets_path, shared_assets)
     try:
         report = _build_adopted(context, path, root, compiler, asset, source, source_meshdir, source_texturedir, objects,
-                                adopted_bodies, fresh, unique, chains, unit, assets, asset_prefix, warnings)
+                                adopted_bodies, fresh, unique, chains, unit, assets, asset_prefix, warnings, covered)
         assets.commit()
         write_xml(root, path)
         write_text(path.parent / "export_report.json", json.dumps(report, indent=2) + "\n")
@@ -794,10 +809,13 @@ def export_adopted(context, filepath):
 
 
 def _build_adopted(context, path, root, compiler, asset, source, source_meshdir, source_texturedir, objects,
-                   adopted_bodies, fresh, unique, chains, unit, assets, asset_prefix, warnings):
-    """Build the adopted world in memory; asset files go through ``assets``."""
-    from .exporter import (ExportError, _extract_geometry, _write_obj, _write_image, check_door, numbers,
-                           inspect_material, property_numbers, property_value, slug)
+                   adopted_bodies, fresh, unique, chains, unit, assets, asset_prefix, warnings, covered):
+    """Build the adopted world in memory; asset files go through ``assets``.
+
+    ``covered`` names the bake sources whose appearance an atlas provides.
+    """
+    from .exporter import (ExportError, _extract_geometry, _write_obj, _write_image, check_door, image_problem, numbers,
+                           inspect_material, profile_text, property_numbers, property_value, slug, texture_colorspace)
     scene = context.scene
     settings = scene.mujoco_world
     # Preserve original material/solver/default declarations. Asset files are
@@ -824,6 +842,11 @@ def _build_adopted(context, path, root, compiler, asset, source, source_meshdir,
                 raise ExportError(f"Missing adopted asset: {original}. Keep the source world assets beside the saved project.")
             name = slug(element.get("name", f"asset_{index}")) + Path(filename).suffix.lower()
             element.set("file", asset_prefix + "/" + assets.copy(original, name))
+            if element.tag == "texture" and element.get("colorspace") is None:
+                # MuJoCo's 'auto' reads the PNG's sRGB chunk, which Blender 5.2
+                # and many editors write when the file is saved again. Pin the
+                # texture mode instead, so a resaved texture keeps its look.
+                element.set("colorspace", texture_colorspace(settings, False))
     original_world = root.find("worldbody")
     world = ET.Element("worldbody", original_world.attrib)
     # Retain lights/cameras/sites and world-level physics declarations. Bodies
@@ -944,7 +967,7 @@ def _build_adopted(context, path, root, compiler, asset, source, source_meshdir,
         attrs = _json(obj, "mjworld_mjcf_geom")
         owner = body_owner(obj)
         target = make_body(owner) if owner else world
-        baked_source = obj.get("mjworld_bake_source") or obj.get("preserved_original_static_visual")
+        baked_source = obj.name in covered
         if attrs:
             attrs = dict(attrs)
             kind = attrs.get("type", "sphere")
@@ -991,7 +1014,7 @@ def _build_adopted(context, path, root, compiler, asset, source, source_meshdir,
                 # Geometry is expressed in its object's rigid rotation frame;
                 # meshes retain arbitrary evaluated scale, modifiers and shear.
                 triangles = [tri for _material, tri in geometry["triangles"]]
-                uv_name = geometry["active_uv"]
+                uv_name = geometry["render_uv"]
                 # Share identical evaluated shapes across repeated task props.
                 # Rounding only the cache key absorbs Blender float32 rotation
                 # noise; the written mesh retains full evaluated precision.
@@ -1027,12 +1050,22 @@ def _build_adopted(context, path, root, compiler, asset, source, source_meshdir,
             label = slug(obj.name) + "_" + str(index)
             material_args = {"name": label + "_material", "rgba": numbers(info["color"]), "specular": "0", "emission": property_numbers([settings.baked_emission])}
             image = info["image"]
+            problem = image_problem(image) if image else None
+            if problem:
+                warnings.append(f"{obj.name}: image '{image.name}' {problem}; export used the flat material colour.")
+                image = None
             if image:
-                image_file = assets.write(label + ".png", lambda target_path: _write_image(image, target_path, baked=True, scene=scene))
-                ET.SubElement(asset, "texture", name=label + "_texture", type="2d", file=asset_prefix + "/" + image_file, colorspace="linear")
+                written = {}
+                image_file = assets.write(label + ".png", lambda target_path: written.update(
+                    _write_image(image, target_path, baked=True, scene=scene, where=obj.name)))
+                ET.SubElement(asset, "texture", name=label + "_texture", type="2d", file=asset_prefix + "/" + image_file,
+                              colorspace=texture_colorspace(settings, written["linear"]))
+                if written["profile"]:
+                    warnings.append(f"{obj.name}: HDR bake '{image.name}' converted to display PNG using {profile_text(written['profile'])}.")
+                warnings.extend(f"{obj.name}: {note}" for note in written["notes"])
                 material_args.update(texture=label + "_texture", rgba="1 1 1 1", texuniform="false")
             ET.SubElement(asset, "material", **material_args)
-            mesh_file = assets.write(label + ".obj", lambda target_path: _write_obj(target_path, geometry, [tri for _m, tri in geometry["triangles"]], info.get("uv_map") or geometry["active_uv"]))
+            mesh_file = assets.write(label + ".obj", lambda target_path: _write_obj(target_path, geometry, [tri for _m, tri in geometry["triangles"]], info.get("uv_map") or geometry["render_uv"]))
             ET.SubElement(asset, "mesh", name=label + "_mesh", file=asset_prefix + "/" + mesh_file, inertia="shell")
             ET.SubElement(target, "geom", name=label, type="mesh", mesh=label + "_mesh", material=material_args["name"], contype="0", conaffinity="0", group="1", mass="0", **_pose(_rigid(obj.matrix_world, unit) if owner is None else _rigid(owner.matrix_world, unit).inverted() @ _rigid(obj.matrix_world, unit)))
             details.append({"source": obj.name, "body": owner.name if owner else "world", "role": "VISUAL", "geometry": "mesh"})

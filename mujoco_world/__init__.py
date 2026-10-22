@@ -10,10 +10,43 @@ bl_info = {
     "category": "Import-Export",
 }
 
+import traceback
+
 import bpy
 from bpy.props import BoolProperty, EnumProperty, FloatProperty, FloatVectorProperty, IntProperty, PointerProperty, StringProperty
 from bpy.types import Operator, Panel, PropertyGroup
 from bpy_extras.io_utils import ExportHelper, ImportHelper
+
+
+# Object settings stay editable on library overrides of linked furniture.
+_OVR = {"LIBRARY_OVERRIDABLE"}
+# Blender 4.5 warns about '//' in path properties without this option, and
+# Blender 4.1 and older reject the option.
+_REL = {"PATH_SUPPORTS_BLEND_RELATIVE"} if bpy.app.version >= (4, 5, 0) else set()
+
+
+def _report_failure(operator, exc):
+    """Report an unexpected error briefly; the traceback goes to the console."""
+    traceback.print_exc()
+    operator.report({"ERROR"}, f"{type(exc).__name__}: {exc} (details in the system console)")
+    return {"CANCELLED"}
+
+
+def _editable(obj):
+    return obj.library is None and obj.is_editable
+
+
+def default_export_path(last_export):
+    """Start the export browser at the last export, or beside a saved .blend.
+
+    An unsaved file resolves '//' against Blender's working directory, so it
+    gets ExportHelper's own default instead.
+    """
+    if last_export and (bpy.data.filepath or not last_export.startswith("//")):
+        return bpy.path.abspath(last_export)
+    if bpy.data.filepath:
+        return bpy.path.abspath("//mujoco_world/scene.xml")
+    return ""
 
 
 ROLES = [
@@ -30,6 +63,10 @@ def role_changed(settings, _context):
     obj = settings.id_data
     if not isinstance(obj, bpy.types.Object):
         return
+    # An Empty only exports its role as a body; the sidebar dropdown must
+    # behave like the role buttons. ``body`` has no update callback.
+    if obj.type == "EMPTY" and settings.role in {"STATIC", "FREE", "HINGE"} and not settings.body:
+        settings.body = True
     if settings.role == "COLLIDER":
         if not settings.get("_helper_wire", False):
             settings["_before_helper_display"] = obj.display_type
@@ -41,25 +78,25 @@ def role_changed(settings, _context):
 
 
 class MJWORLD_ObjectSettings(PropertyGroup):
-    body: BoolProperty(name="Rigid body group", default=False,
+    body: BoolProperty(name="Rigid body group", default=False, override=_OVR,
                        description="An Empty owns all descendant visual and collision parts as one rigid body")
-    role: EnumProperty(name="Object type", items=ROLES, default="STATIC", update=role_changed)
+    role: EnumProperty(name="Object type", items=ROLES, default="STATIC", update=role_changed, override=_OVR)
     collision: EnumProperty(name="Collision shape", items=[
         ("BOX", "Box", "Fast bounding box; use separate tabletop and legs to leave the space under a table open"),
         ("SPHERE", "Sphere", "Enclosing sphere; useful for a ball or apple"),
         ("CYLINDER", "Cylinder (local Z)", "Enclosing cylinder along the object's local Z axis"),
         ("CONVEX", "Convex mesh", "Convex hull, NOT the original concave mesh; hollow areas will be filled"),
-    ], default="BOX")
-    mass: FloatProperty(name="Weight (kg)", default=1.0, min=0.001, soft_max=30)
-    friction: FloatVectorProperty(name="Friction", size=3, default=(0.8, 0.005, 0.0001), min=0.0)
-    hinge_axis: EnumProperty(name="Hinge direction", items=[("Z", "Vertical (local Z)", "Usually correct for a door"), ("X", "Local X", ""), ("Y", "Local Y", "")], default="Z")
-    hinge_min: FloatProperty(name="Open limit (degrees)", default=-110.0, min=-360.0, max=360.0)
-    hinge_max: FloatProperty(name="Closed limit (degrees)", default=0.0, min=-360.0, max=360.0)
-    hinge_start: FloatProperty(name="Starting angle (degrees)", default=0.0, min=-360.0, max=360.0)
-    damping: FloatProperty(name="Hinge resistance", default=0.3, min=0.0, soft_max=10)
-    baked: BoolProperty(name="Image already contains lighting", default=False,
+    ], default="BOX", override=_OVR)
+    mass: FloatProperty(name="Weight (kg)", default=1.0, min=0.001, soft_max=30, override=_OVR)
+    friction: FloatVectorProperty(name="Friction", size=3, default=(0.8, 0.005, 0.0001), min=0.0, override=_OVR)
+    hinge_axis: EnumProperty(name="Hinge direction", items=[("Z", "Vertical (local Z)", "Usually correct for a door"), ("X", "Local X", ""), ("Y", "Local Y", "")], default="Z", override=_OVR)
+    hinge_min: FloatProperty(name="Open limit (degrees)", default=-110.0, min=-360.0, max=360.0, override=_OVR)
+    hinge_max: FloatProperty(name="Closed limit (degrees)", default=0.0, min=-360.0, max=360.0, override=_OVR)
+    hinge_start: FloatProperty(name="Starting angle (degrees)", default=0.0, min=-360.0, max=360.0, override=_OVR)
+    damping: FloatProperty(name="Hinge resistance", default=0.3, min=0.0, soft_max=10, override=_OVR)
+    baked: BoolProperty(name="Image already contains lighting", default=False, override=_OVR,
                         description="Use the baked texture without treating it as an ordinary dark albedo; also detected for an Emission shader")
-    advanced: BoolProperty(name="Advanced", default=False)
+    advanced: BoolProperty(name="Advanced", default=False, override=_OVR)
 
 
 class MJWORLD_SceneSettings(PropertyGroup):
@@ -85,10 +122,11 @@ class MJWORLD_SceneSettings(PropertyGroup):
     ], default="DISPLAY")
     baked_emission: FloatProperty(name="Baked texture brightness", default=0.2, min=0.0, max=1.0)
     advanced: BoolProperty(name="World advanced settings", default=False)
-    last_export: StringProperty(name="Last export", default="", subtype="FILE_PATH")
-    asset_directory: StringProperty(name="Shared asset folder", default="", subtype="DIR_PATH",
+    last_export: StringProperty(name="Last export", default="", subtype="FILE_PATH", options=_REL)
+    asset_directory: StringProperty(name="Shared asset folder", default="", subtype="DIR_PATH", options=_REL,
                                    description="Optional shared folder, relative to the blend file. Empty uses an assets folder beside each exported XML")
-    bake_directory: StringProperty(name="Bake folder", default="//baked_lighting", subtype="DIR_PATH")
+    bake_directory: StringProperty(name="Bake folder", default="//baked_lighting", subtype="DIR_PATH", options=_REL,
+                                   description="Folder for the lightmap EXR and PNG. A '//' path needs a saved .blend file")
     bake_size: EnumProperty(name="Atlas resolution", items=[("512", "512", "Quick preview"), ("1024", "1024", "Small world"), ("2048", "2048", "Room details"), ("4096", "4096", "Large world")], default="2048")
     bake_samples: IntProperty(name="Bake samples", default=128, min=1, max=4096)
 
@@ -104,18 +142,30 @@ class MJWORLD_OT_role(Operator):
         return context.mode == "OBJECT" and any(o.type in {"MESH", "EMPTY"} for o in context.selected_objects)
 
     def execute(self, context):
-        count = 0
-        for obj in context.selected_objects:
-            if obj.type not in {"MESH", "EMPTY"}:
-                continue
-            if obj.type == "EMPTY":
-                obj.mujoco_world.body = True
-            obj.mujoco_world.role = self.role
-            if self.role == "HINGE":
-                obj.mujoco_world.mass = 8.0
-                obj.mujoco_world.collision = "BOX"
-            count += 1
-        self.report({"INFO"}, f"Set {count} object(s) to {dict((r[0], r[1]) for r in ROLES)[self.role]}")
+        try:
+            count = linked = 0
+            for obj in context.selected_objects:
+                if obj.type not in {"MESH", "EMPTY"}:
+                    continue
+                if not _editable(obj):
+                    # Edits to linked data are discarded when the file reloads.
+                    linked += 1
+                    continue
+                if obj.type == "EMPTY":
+                    obj.mujoco_world.body = True
+                obj.mujoco_world.role = self.role
+                if self.role == "HINGE":
+                    obj.mujoco_world.mass = 8.0
+                    obj.mujoco_world.collision = "BOX"
+                count += 1
+        except Exception as exc:
+            return _report_failure(self, exc)
+        skipped = f" Skipped {linked} linked object(s); make a library override to edit them." if linked else ""
+        if not count:
+            self.report({"ERROR"}, "Nothing changed." + skipped)
+            return {"CANCELLED"}
+        self.report({"WARNING" if linked else "INFO"},
+                    f"Set {count} object(s) to {dict((r[0], r[1]) for r in ROLES)[self.role]}." + skipped)
         return {"FINISHED"}
 
 
@@ -130,9 +180,19 @@ class MJWORLD_OT_hinge_cursor(Operator):
         return context.mode == "OBJECT" and context.object is not None and context.object.type in {"MESH", "EMPTY"}
 
     def execute(self, context):
+        try:
+            return self._execute(context)
+        except Exception as exc:
+            return _report_failure(self, exc)
+
+    def _execute(self, context):
         # Use a narrow temporary selection so an adjacent doorframe is unaffected.
         selected = list(context.selected_objects)
         active = context.object
+        if not _editable(active) or (active.type == "MESH" and not _editable(active.data)):
+            self.report({"ERROR"}, f"{active.name} is linked from another file. Make a library override "
+                                   "(with editable mesh data for a mesh door) first.")
+            return {"CANCELLED"}
         if active.type == "EMPTY":
             children = [(obj, obj.matrix_world.copy()) for obj in active.children]
             world = active.matrix_world.copy()
@@ -186,12 +246,17 @@ class MJWORLD_OT_group(Operator):
 
     def execute(self, context):
         from .project import group_selected
+        linked = sum(1 for obj in context.selected_objects if not _editable(obj))
         try:
             obj = group_selected(context, self.role)
         except (ValueError, RuntimeError) as exc:
             self.report({"ERROR"}, str(exc))
             return {"CANCELLED"}
-        self.report({"INFO"}, f"Created {obj.name}. Set its total mass; child Collision helpers stay invisible.")
+        except Exception as exc:
+            return _report_failure(self, exc)
+        skipped = f" Left out {linked} linked object(s); make a library override to group them." if linked else ""
+        self.report({"WARNING" if linked else "INFO"},
+                    f"Created {obj.name}. Set its total mass; child Collision helpers stay invisible." + skipped)
         return {"FINISHED"}
 
 
@@ -210,6 +275,8 @@ class MJWORLD_OT_adopt(Operator, ImportHelper):
         except (OSError, ValueError, RuntimeError) as exc:
             self.report({"ERROR"}, str(exc))
             return {"CANCELLED"}
+        except Exception as exc:
+            return _report_failure(self, exc)
         self.report({"INFO"}, f"Linked {report['bodies']} bodies and {report['geoms']} analytic/visual parts. Blender edits preserved.")
         return {"FINISHED"}
 
@@ -218,6 +285,9 @@ class MJWORLD_OT_bake(Operator):
     bl_idname = "mjworld.bake_lighting"
     bl_label = "Bake static lighting"
     bl_description = "Bake fixed furniture and walls to one UV atlas; keep movable props and the door dynamic"
+    # Nested bpy.ops calls push no undo step; without this, Ctrl+Z after a
+    # bake also reverts the action before it.
+    bl_options = {"REGISTER", "UNDO"}
 
     @classmethod
     def poll(cls, context):
@@ -227,23 +297,52 @@ class MJWORLD_OT_bake(Operator):
         from .baking import bake_static
         settings = context.scene.mujoco_world
         try:
-            report = bake_static(context, bpy.path.abspath(settings.bake_directory), atlas_size=int(settings.bake_size), samples=settings.bake_samples)
+            # bake_static resolves the folder itself, so it can refuse a '//'
+            # path while the .blend is unsaved.
+            report = bake_static(context, settings.bake_directory, atlas_size=int(settings.bake_size), samples=settings.bake_samples)
         except (OSError, ValueError, RuntimeError) as exc:
             self.report({"ERROR"}, str(exc))
             return {"CANCELLED"}
-        self.report({"INFO"}, f"Baked {report['source_count']} fixed parts. Export world to use the lighting in MuJoCo.")
+        except Exception as exc:
+            return _report_failure(self, exc)
+        notes = list(report["warnings"])
+        if report["skipped"]:
+            notes.insert(0, "Skipped meshes without faces: " + ", ".join(report["skipped"][:5])
+                         + (" ..." if len(report["skipped"]) > 5 else ""))
+        if report["restored"]:
+            notes.insert(0, "Restored parts no longer baked: " + ", ".join(report["restored"][:5])
+                         + (" ..." if len(report["restored"]) > 5 else ""))
+        for note in notes:
+            self.report({"WARNING"}, note)
+        self.report({"WARNING" if notes else "INFO"},
+                    f"Baked {report['source_count']} fixed parts. Export world to use the lighting in MuJoCo.")
         return {"FINISHED"}
 
 
 class MJWORLD_OT_restore(Operator):
     bl_idname = "mjworld.restore_sources"
     bl_label = "Edit original surfaces"
-    bl_description = "Restore the original fixed surfaces and remove the generated lighting atlas so you can edit and rebake"
+    bl_description = ("Restore the original fixed surfaces and delete the generated lighting atlas so you can edit and rebake. "
+                      "The EXR and PNG in the bake folder stay on disk")
     bl_options = {"REGISTER", "UNDO"}
+
+    @classmethod
+    def poll(cls, context):
+        from .baking import bake_leftovers
+        return context.mode == "OBJECT" and bool(bake_leftovers(context.scene))
+
+    def invoke(self, context, event):
+        # It deletes the packed lightmap, the only in-file copy of the bake.
+        return context.window_manager.invoke_confirm(self, event)
 
     def execute(self, context):
         from .baking import restore_sources
-        restore_sources(context)
+        try:
+            count = restore_sources(context)
+        except Exception as exc:
+            return _report_failure(self, exc)
+        self.report({"INFO"}, f"Restored {count} original surface(s); the lighting atlas was removed."
+                    if count else "No hidden surfaces to restore; removed the leftover bake objects.")
         return {"FINISHED"}
 
 
@@ -274,7 +373,7 @@ class MJWORLD_OT_export(Operator, ExportHelper):
 
     def invoke(self, context, event):
         if not self.filepath:
-            self.filepath = bpy.path.abspath("//mujoco_world/scene.xml")
+            self.filepath = default_export_path(context.scene.mujoco_world.last_export)
         return super().invoke(context, event)
 
     def execute(self, context):
@@ -284,6 +383,8 @@ class MJWORLD_OT_export(Operator, ExportHelper):
         except (ExportError, OSError, ValueError, RuntimeError) as exc:
             self.report({"ERROR"}, str(exc))
             return {"CANCELLED"}
+        except Exception as exc:
+            return _report_failure(self, exc)
         context.scene.mujoco_world.last_export = self.filepath
         warnings = result["warnings"]
         self.report({"WARNING" if warnings else "INFO"},
@@ -312,6 +413,8 @@ class MJWORLD_PT_main(Panel):
             box = layout.box()
             box.label(text=obj.name, icon="EMPTY_AXIS" if obj.type == "EMPTY" else "MESH_DATA")
             box.prop(obj.mujoco_world, "role", text="")
+            if obj.type == "EMPTY":
+                box.prop(obj.mujoco_world, "body")
             role = obj.mujoco_world.role
             if role == "COLLIDER":
                 box.label(text="Invisible in MuJoCo; keep visible here.", icon="INFO")
@@ -341,7 +444,8 @@ class MJWORLD_PT_main(Panel):
         layout.separator()
         layout.label(text="2. Optional: bake the room lighting")
         layout.operator("mjworld.bake_lighting", icon="RENDER_STILL")
-        if any(o.get("mjworld_baked_atlas") or o.get("baked_static_visual") for o in context.scene.objects):
+        from .baking import bake_leftovers
+        if bake_leftovers(context.scene):
             layout.operator("mjworld.restore_sources", icon="LOOP_BACK")
         layout.separator()
         layout.label(text="3. Export your world")
@@ -384,7 +488,7 @@ CLASSES = (MJWORLD_ObjectSettings, MJWORLD_SceneSettings, MJWORLD_OT_role, MJWOR
 def register():
     for cls in CLASSES:
         bpy.utils.register_class(cls)
-    bpy.types.Object.mujoco_world = PointerProperty(type=MJWORLD_ObjectSettings)
+    bpy.types.Object.mujoco_world = PointerProperty(type=MJWORLD_ObjectSettings, override=_OVR)
     bpy.types.Scene.mujoco_world = PointerProperty(type=MJWORLD_SceneSettings)
     bpy.types.TOPBAR_MT_file_export.append(export_menu)
 
