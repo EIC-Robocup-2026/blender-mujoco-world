@@ -41,7 +41,8 @@ for y in range(32):
         pixels.extend([x / 31, y / 31, 0.4, 1])
 image.pixels[:] = pixels
 material = bpy.data.materials.new("Baked emission image")
-material.use_nodes = True
+if bpy.app.version < (5, 0, 0):
+    material.use_nodes = True  # Blender 5 always uses the node tree.
 nodes = material.node_tree.nodes
 nodes.clear()
 texture = nodes.new("ShaderNodeTexImage")
@@ -60,7 +61,8 @@ for y in range(16):
         hdr_pixels.extend([value, value, value, 1])
 hdr.pixels[:] = hdr_pixels
 hdr_material = bpy.data.materials.new("HDR bake emission")
-hdr_material.use_nodes = True
+if bpy.app.version < (5, 0, 0):
+    hdr_material.use_nodes = True
 hdr_nodes = hdr_material.node_tree.nodes
 hdr_nodes.clear()
 hdr_texture = hdr_nodes.new("ShaderNodeTexImage")

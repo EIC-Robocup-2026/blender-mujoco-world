@@ -157,7 +157,8 @@ def build_world(directory, world=WORLD):
     crate = empty("Crate", (1, 0, 0.3))
     crate_box = box("Crate_box", (1, 0, 0.3), (0.2, 0.2, 0.2), parent=crate)
     material = bpy.data.materials.new("crate textured")
-    material.use_nodes = True
+    if bpy.app.version < (5, 0, 0):
+        material.use_nodes = True  # Blender 5 always uses the node tree.
     node = material.node_tree.nodes.new("ShaderNodeTexImage")
     node.image = image
     material.node_tree.links.new(node.outputs["Color"], material.node_tree.nodes["Principled BSDF"].inputs["Base Color"])
@@ -347,7 +348,8 @@ def inplace_textures():
     crate_box = bpy.context.scene.objects["Crate_box"]
     textured = crate_box.data.materials[0]
     flat = bpy.data.materials.new("flat green")
-    flat.use_nodes = True
+    if bpy.app.version < (5, 0, 0):
+        flat.use_nodes = True
     flat.node_tree.nodes["Principled BSDF"].inputs["Base Color"].default_value = (0, 1, 0, 1)
     crate_box.data.materials[0] = flat
     export_world(bpy.context, str(source))

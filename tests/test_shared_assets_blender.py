@@ -68,7 +68,8 @@ check_paths(generic)
 image = bpy.data.images.new("Shared generic label", width=2, height=2)
 image.pixels[:] = [1, 0, 0, 1] * 4
 material = bpy.data.materials.new("Shared generic material")
-material.use_nodes = True
+if bpy.app.version < (5, 0, 0):
+    material.use_nodes = True  # Blender 5 always uses the node tree.
 texture = material.node_tree.nodes.new("ShaderNodeTexImage")
 texture.image = image
 material.node_tree.links.new(texture.outputs["Color"], material.node_tree.nodes.get("Principled BSDF").inputs["Base Color"])
